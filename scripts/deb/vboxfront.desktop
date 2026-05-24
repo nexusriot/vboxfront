@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=VBoxFront
+GenericName=VirtualBox Disk Manager
+Comment=PyQt6 frontend for VBoxManage disk operations
+Exec=vboxfront
+Icon=virtualbox
+Terminal=false
+Categories=Utility;System;Emulator;
+Keywords=VirtualBox;VBoxManage;VDI;VMDK;VHD;disk;
+StartupNotify=true

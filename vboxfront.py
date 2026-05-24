@@ -10,8 +10,13 @@ import shutil
 import sys
 from dataclasses import dataclass
 
-from PyQt6.QtCore import QEventLoop
-from PyQt6.QtCore import QProcess, Qt, pyqtSignal
+from PyQt6.QtCore import (
+    QProcess,
+    Qt,
+    pyqtSignal,
+    QEventLoop
+)
+
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
