@@ -21,7 +21,9 @@ output is streamed live, so it stays transparent about what it runs.
 - **Convert / Clone** — clone to a different format
   (`clonemedium --format`).
 - **Import RAW** — convert a raw `.img/.raw/.bin` into a managed format
-  (`convertfromraw`).
+  (`convertfromraw`); the result is automatically registered.
+- **Remove** — unregister a disk (`closemedium`), optionally deleting the
+  backing file (`--delete`); defaults to the safe keep-file action.
 - **Info** — full medium details (`showmediuminfo`).
 - Live command output panel with a **Cancel** button; the disk list refreshes
   automatically after each operation.

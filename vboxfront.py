@@ -72,11 +72,14 @@ def parse_hdd_list(text: str) -> list[DiskRecord]:
                 kv[k.strip()] = v.strip()
         if "UUID" not in kv or "Location" not in kv:
             continue
+        # `VBoxManage list hdds` reports the format as "Storage format" and has
+        # no "Size on disk" field; accept the historical "Format" key too, and
+        # fall back to the long-form "Size on disk" key when present (-l output).
         records.append(
             DiskRecord(
                 uuid=kv.get("UUID", ""),
                 location=kv.get("Location", ""),
-                fmt=kv.get("Format", ""),
+                fmt=kv.get("Storage format") or kv.get("Format", ""),
                 capacity=kv.get("Capacity", ""),
                 size_on_disk=kv.get("Size on disk", ""),
             )
@@ -125,6 +128,7 @@ class CommandRunner(QWidget):
         self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.proc.readyReadStandardOutput.connect(self._on_output)
         self.proc.finished.connect(self._on_finished)
+        self.proc.errorOccurred.connect(self._on_error)
 
         pretty = " ".join(shlex.quote(a) for a in [vbm, *args])
         self.cmd_label.setText(f"Running: {pretty}")
@@ -146,6 +150,19 @@ class CommandRunner(QWidget):
             self.output.moveCursor(self.output.textCursor().MoveOperation.End)
             self.output.insertPlainText(data)
             self.output.moveCursor(self.output.textCursor().MoveOperation.End)
+
+    def _on_error(self, error):
+        # FailedToStart fires *instead of* finished, so reset state here.
+        if error == QProcess.ProcessError.FailedToStart:
+            self.output.appendPlainText(
+                "[error] Failed to start VBoxManage (not executable or missing).\n"
+            )
+            self.cmd_label.setText("Idle.")
+            self.cancel_btn.setEnabled(False)
+            proc, self.proc = self.proc, None
+            if proc:
+                proc.deleteLater()
+            self.finished.emit(126)
 
     def _on_finished(self, code: int, _status):
         self.output.appendPlainText(f"[exit {code}]\n")
@@ -183,6 +200,9 @@ class MainWindow(QMainWindow):
         self.resize(1100, 720)
 
         self.disks: list[DiskRecord] = []
+        # Path to register with `openmedium` once the current command succeeds
+        # (used after `convertfromraw`, which only writes the file).
+        self._pending_register: str | None = None
 
         self._build_ui()
         self._refresh_check_vbm()
@@ -223,6 +243,13 @@ class MainWindow(QMainWindow):
         act_info = QAction("Info", self)
         act_info.triggered.connect(self.show_info_selected)
         toolbar.addAction(act_info)
+
+        toolbar.addSeparator()
+
+        act_remove = QAction("Remove…", self)
+        act_remove.setShortcut(QKeySequence.StandardKey.Delete)
+        act_remove.triggered.connect(self.remove_selected)
+        toolbar.addAction(act_remove)
 
         # central splitter: table on top, runner below
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -295,6 +322,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"list hdds failed (exit {code})")
             self.runner.output.appendPlainText(output)
             return
+        prev = self.selected_disk()
+        prev_uuid = prev.uuid if prev else None
+
         self.disks = parse_hdd_list(output)
         self.table.setRowCount(len(self.disks))
         for i, d in enumerate(self.disks):
@@ -303,6 +333,13 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(val)
                 item.setToolTip(val)
                 self.table.setItem(i, col, item)
+
+        # Restore the previous selection so operations can be chained.
+        if prev_uuid is not None:
+            for i, d in enumerate(self.disks):
+                if d.uuid == prev_uuid:
+                    self.table.selectRow(i)
+                    break
         self.statusBar().showMessage(f"{len(self.disks)} registered disk(s).")
 
     def add_disk_from_file(self):
@@ -377,31 +414,82 @@ class MainWindow(QMainWindow):
         fmt, dst = ask_target_format_and_path(self, src, default_fmt="VDI")
         if not dst or not self._require_idle():
             return
+        # convertfromraw only creates the file; register it once it completes.
+        self._pending_register = dst
         self.runner.run(["convertfromraw", src, dst, "--format", fmt])
 
+    def remove_selected(self):
+        d = self._require_selection()
+        if not d:
+            return
+        dlg = RemoveDialog(d, self)
+        if not dlg.exec() or not self._require_idle():
+            return
+        args = ["closemedium", "disk", d.uuid]
+        if dlg.delete_file:
+            args.append("--delete")
+        self.runner.run(args)
+
     def _on_runner_finished(self, code: int):
+        pending, self._pending_register = self._pending_register, None
+        if pending and code == 0 and os.path.exists(pending):
+            # Register the freshly converted image so it shows in the list.
+            if self.runner.run(["openmedium", "disk", pending]):
+                return  # refresh happens when this follow-up command finishes
         # Most operations change the registry; refresh quietly.
         self.refresh_disks()
 
 
-class ResizeDialog(QWidget):
+class _LoopDialog(QWidget):
+    """Base for the app's lightweight modal dialogs.
+
+    Provides a blocking ``exec()`` that spins a local event loop and returns
+    whether the dialog was accepted, so subclasses only define their widgets
+    and set ``self._accepted`` in their OK handler.
+    """
+
+    def __init__(self, parent, title: str):
+        super().__init__(parent, Qt.WindowType.Dialog)
+        self.setWindowTitle(title)
+        self._accepted = False
+
+    def exec(self) -> bool:
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.show()
+        loop = QEventLoop()
+        self._loop = loop
+        orig_close = self.closeEvent
+
+        def closeEvent(ev):
+            orig_close(ev)
+            loop.quit()
+
+        self.closeEvent = closeEvent  # type: ignore[assignment]
+        loop.exec()
+        return self._accepted
+
+
+class ResizeDialog(_LoopDialog):
     """Modal-ish resize dialog using QMessageBox-style API."""
 
     def __init__(self, disk: DiskRecord, parent):
-        super().__init__(parent, Qt.WindowType.Dialog)
-        self.setWindowTitle("Resize disk")
+        super().__init__(parent, "Resize disk")
         self.size_mb = 0
-        self._accepted = False
 
         layout = QFormLayout(self)
         layout.addRow(QLabel(f"<b>{os.path.basename(disk.location)}</b>"))
         layout.addRow("Current capacity:", QLabel(disk.capacity or "?"))
 
         self.spin = QSpinBox()
-        self.spin.setRange(1, 4 * 1024 * 1024)  # up to 4 TiB
-        self.spin.setSuffix(" MiB")
+        self.spin.setRange(1, 4 * 1024 * 1024)  # up to 4 TB
+        # VBoxManage --resize takes megabytes (MB), matching the "MBytes" that
+        # `list hdds` reports for capacity, so label it MB to avoid MiB/MB drift.
+        self.spin.setSuffix(" MB")
         self.spin.setValue(self._guess_current_mb(disk.capacity))
         layout.addRow("New size:", self.spin)
+        layout.addRow(
+            QLabel("<i>Note: VBoxManage can only grow disks, not shrink them.</i>")
+        )
 
         btns = QHBoxLayout()
         ok = QPushButton("Resize")
@@ -423,32 +511,12 @@ class ResizeDialog(QWidget):
         self._accepted = True
         self.close()
 
-    def exec(self) -> bool:
-        self.setWindowModality(Qt.WindowModality.ApplicationModal)
-        self.show()
-        # spin a local event loop
-        loop = QEventLoop()
-        self.destroyed.connect(loop.quit)
-        # also exit when hidden
-        self._loop = loop
-        orig_close = self.closeEvent
 
-        def closeEvent(ev):
-            orig_close(ev)
-            loop.quit()
-
-        self.closeEvent = closeEvent  # type: ignore[assignment]
-        loop.exec()
-        return self._accepted
-
-
-class ConvertDialog(QWidget):
+class ConvertDialog(_LoopDialog):
     def __init__(self, disk: DiskRecord, parent):
-        super().__init__(parent, Qt.WindowType.Dialog)
-        self.setWindowTitle("Convert / Clone disk")
+        super().__init__(parent, "Convert / Clone disk")
         self.target_format = "VDI"
         self.target_path = ""
-        self._accepted = False
 
         layout = QFormLayout(self)
         layout.addRow(QLabel(f"Source: <b>{os.path.basename(disk.location)}</b> ({disk.fmt})"))
@@ -521,20 +589,57 @@ class ConvertDialog(QWidget):
         self._accepted = True
         self.close()
 
-    def exec(self) -> bool:
-        self.setWindowModality(Qt.WindowModality.ApplicationModal)
-        self.show()
-        loop = QEventLoop()
-        self._loop = loop
-        orig_close = self.closeEvent
 
-        def closeEvent(ev):
-            orig_close(ev)
-            loop.quit()
+class RemoveDialog(_LoopDialog):
+    """Unregister a disk, optionally deleting the backing file."""
 
-        self.closeEvent = closeEvent  # type: ignore[assignment]
-        loop.exec()
-        return self._accepted
+    def __init__(self, disk: DiskRecord, parent):
+        super().__init__(parent, "Remove disk")
+        self.delete_file = False
+
+        layout = QFormLayout(self)
+        layout.addRow(QLabel(f"<b>{os.path.basename(disk.location)}</b>"))
+        layout.addRow("Location:", QLabel(disk.location or "?"))
+        layout.addRow("UUID:", QLabel(disk.uuid))
+
+        self.mode = QComboBox()
+        # Safe default first: unregister but keep the file on disk.
+        self.mode.addItems(
+            ["Unregister only (keep file)", "Delete file from disk"]
+        )
+        layout.addRow("Action:", self.mode)
+        layout.addRow(
+            QLabel(
+                "<i>Unregister removes the disk from VirtualBox's media "
+                "registry. Delete also erases the file permanently.</i>"
+            )
+        )
+
+        btns = QHBoxLayout()
+        ok = QPushButton("Remove")
+        cancel = QPushButton("Cancel")
+        ok.clicked.connect(self._ok)
+        cancel.clicked.connect(self.close)
+        btns.addStretch(1)
+        btns.addWidget(cancel)
+        btns.addWidget(ok)
+        layout.addRow(btns)
+
+    def _ok(self):
+        delete = self.mode.currentIndex() == 1
+        if delete:
+            ret = QMessageBox.warning(
+                self,
+                "Delete file?",
+                "This will permanently delete the disk image file. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+        self.delete_file = delete
+        self._accepted = True
+        self.close()
 
 
 def ask_target_format_and_path(parent, src_path: str, default_fmt: str = "VDI"):
