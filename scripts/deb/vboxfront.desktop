@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=VBoxFront
-GenericName=VirtualBox Disk Manager
-Comment=PyQt6 frontend for VBoxManage disk operations
+GenericName=VirtualBox Media Manager
+Comment=Manage VirtualBox media: create, clone, resize, attach, encrypt
 Exec=vboxfront
 Icon=virtualbox
 Terminal=false
 Categories=Utility;System;Emulator;
-Keywords=VirtualBox;VBoxManage;VDI;VMDK;VHD;disk;
+Keywords=VirtualBox;VBoxManage;VDI;VMDK;VHD;ISO;DVD;floppy;disk;media;
 StartupNotify=true

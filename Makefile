@@ -21,7 +21,7 @@ export VERSION
 
 .DEFAULT_GOAL := build
 
-.PHONY: build deb run clean version help
+.PHONY: build deb run test clean version help
 
 ## build: PyInstaller standalone binary -> dist/vboxfront
 build:
@@ -34,6 +34,10 @@ deb:
 ## run: run from source (provisions .venv on first use)
 run:
 	$(BUILD) --run
+
+## test: run the unit test suite (offscreen, no display needed)
+test:
+	$(BUILD) --test
 
 ## clean: remove build/, dist/, .venv and PyInstaller caches
 clean:

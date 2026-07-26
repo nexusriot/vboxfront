@@ -6,8 +6,9 @@
 # Output: dist/vboxfront
 #
 # Usage:
-#   build/build.sh            # build standalone binary
-#   build/build.sh --run      # provision .venv and run from source
+#   scripts/build.sh            # build standalone binary
+#   scripts/build.sh --run      # provision .venv and run from source
+#   scripts/build.sh --test     # run the unit test suite (offscreen)
 #
 # PyInstaller does NOT cross-compile; the binary is for the host arch.
 
@@ -22,9 +23,10 @@ APP="vboxfront"
 SPEC="$ROOT/$APP.spec"
 
 mode="build"
-if [ "${1:-}" = "--run" ]; then
-    mode="run"
-fi
+case "${1:-}" in
+    --run)  mode="run" ;;
+    --test) mode="test" ;;
+esac
 
 if [ ! -x "$VENV/bin/python" ]; then
     echo ">> creating venv in $VENV"
@@ -39,6 +41,11 @@ python -m pip install --quiet -r "$ROOT/requirements.txt"
 
 if [ "$mode" = "run" ]; then
     exec python "$ROOT/$APP.py" "$@"
+fi
+
+if [ "$mode" = "test" ]; then
+    export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
+    exec python -m unittest discover -s "$ROOT/tests" -t "$ROOT" -v
 fi
 
 python -m pip install --quiet pyinstaller

@@ -1,3 +1,14 @@
+vboxfront (1.1.0) unstable; urgency=medium
+
+  * Media tabs (hard disks / DVDs / floppies) with diff-chain tree view.
+  * Create disk, attach/detach to VMs, properties, move, encryption.
+  * Progress bar, filter, sortable columns, human-readable sizes,
+    context menu, batch compact, configurable VBoxManage path.
+  * App-side media library replaces the removed `openmedium` registration.
+  * Unit test suite (offscreen) and CI.
+
+ -- Vlad Ananyev <vlananyev@gmail.com>  Sun, 26 Jul 2026 00:00:00 +0000
+
 vboxfront (1.0.0) unstable; urgency=medium
 
   * Initial Debian packaging.

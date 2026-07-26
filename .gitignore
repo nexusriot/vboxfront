@@ -1,8 +1,15 @@
-.venv/
-.vscode/
-.idea/
-__pycache__/
-build/
-dist/
+# Anchored to the repo root so a future source dir with the same name
+# (e.g. a "build" or "dist" package) can never be untracked by accident.
+/.venv/
+/.vscode/
+/.idea/
+/build/
+/dist/
 
+# Bytecode caches appear beside the sources and under tests/.
+__pycache__/
+
+# PyInstaller spec files are usually generated, but vboxfront.spec is the
+# hand-maintained build input required by scripts/build.sh — keep it tracked.
 *.spec
+!/vboxfront.spec
