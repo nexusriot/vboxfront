@@ -12,7 +12,9 @@ cd "$(dirname "$0")/.."
 
 ROOT="$PWD"
 APP="vboxfront"
-VERSION="${VERSION:-1.0.0}"
+# Fall back to the source's own APP_VERSION when the caller (or the Makefile's
+# `git describe`) has nothing to offer — never to a literal that can go stale.
+VERSION="${VERSION:-$(sed -n 's/^APP_VERSION = "\(.*\)"/\1/p' "$ROOT/vboxfront.py")}"
 VERSION="${VERSION#v}"                       # drop leading "v"
 # Debian requires Version to start with a digit. `git describe --always`
 # falls back to a bare commit hash when no tags exist — prefix it so dpkg
@@ -24,8 +26,13 @@ esac
 ARCH="${ARCH:-$(dpkg --print-architecture 2>/dev/null || uname -m)}"
 
 BIN="$ROOT/dist/$APP"
-if [ ! -f "$BIN" ]; then
-    echo ">> binary $BIN not found; building first"
+# Rebuild when the binary is missing *or* stale: packaging a leftover binary
+# from an earlier version produces a .deb whose control file and executable
+# disagree about what they are.
+if [ ! -f "$BIN" ] \
+   || [ "$ROOT/vboxfront.py" -nt "$BIN" ] \
+   || [ "$ROOT/vboxfront.spec" -nt "$BIN" ]; then
+    echo ">> binary $BIN missing or older than the sources; building first"
     "$ROOT/scripts/build.sh"
 fi
 

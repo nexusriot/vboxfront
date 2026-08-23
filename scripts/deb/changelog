@@ -1,3 +1,114 @@
+vboxfront (1.5.0) UNRELEASED; urgency=medium
+
+  * Development version; no changes yet. Change the distribution to
+    "unstable" once this release has something in it.
+
+ -- Vlad Ananyev <vlananyev@gmail.com>  Sun, 23 Aug 2026 00:00:00 +0000
+
+vboxfront (1.4.0) unstable; urgency=medium
+
+  * Remember the window between sessions: size and position (including
+    maximised state and which screen), the output-panel splitter, the selected
+    tab, and each tab's column widths and order. Stored in the same per-user
+    settings as the rest of the configuration. Columns are now resizable and
+    movable; they are auto-fitted once on a first run.
+  * Ask before quitting while a command is still running, rather than killing
+    it and possibly leaving a half-written image.
+  * Warn when the VBoxManage location set in Settings is not an executable
+    file. It was honoured but never checked, so every command failed with a
+    bare "Failed to start" and nothing pointed back at Settings.
+  * Record the right command in the history when VBoxManage cannot be launched
+    at all: the failure was being filed against whichever command ran before
+    it, and the one that failed was not recorded.
+  * Encryption dialog: "Check current password" button (`checkmediumpwd`).
+  * Confirm before hex-dumping more than a megabyte into the output panel.
+  * A long command line no longer widens the output panel's header if it is
+    set directly rather than through the status helper.
+  * Creating a floppy image no longer adds a redundant media-library entry;
+    createmedium already registers what it creates.
+
+ -- Vlad Ananyev <vlananyev@gmail.com>  Sun, 23 Aug 2026 00:00:00 +0000
+
+vboxfront (1.3.1) unstable; urgency=medium
+
+  * Fix `Access Error:` being folded into the State value. VBoxManage prints
+    that field, and its unindented "VD: error ..." continuation, for a medium
+    whose file it cannot open; because the field was missing from the known
+    key list it landed in State, which showed a three-line blob in the State
+    column, stopped inaccessible media from being highlighted red, and let
+    "Compact all VDIs" pick up a broken disk and abort the batch on it. The
+    reason is now its own field, shown in the State tooltip and in the Resolve
+    dialog.
+  * Remove: refuse a medium that has differencing children, instead of letting
+    closemedium fail with VBOX_E_OBJECT_IN_USE.
+  * Keep a long command line from dragging the output panel's header past the
+    window edge; it is elided, with the full line in the tooltip.
+
+ -- Vlad Ananyev <vlananyev@gmail.com>  Sun, 23 Aug 2026 00:00:00 +0000
+
+vboxfront (1.3.0) unstable; urgency=medium
+
+  * Contents: read a byte range straight out of an image without mounting it
+    (`mediumio cat`) — hex dump into the output panel or extract the range to
+    a file. Works on encrypted media, which refuse to be read otherwise.
+  * Create differencing images (`createmedium --diffparent`): the listing
+    already drew these chains as a tree, now it can build one.
+  * Format a medium as FAT (`mediumio formatfat`), and create floppy images
+    pre-formatted (`--variant Formatted`) so they are usable straight away.
+  * Ask VirtualBox which formats exist instead of hardcoding them
+    (`list hddbackends`): QCOW, QED and Parallels are now offered where they
+    apply, each with only the variants its backend supports, and read-only
+    formats are correctly never offered as targets.
+  * Immutable disks: expose `--autoreset`, and say plainly that VirtualBox
+    will not change the type of a differencing image rather than surfacing
+    that as a COM error.
+  * Attach: optional `--mtype`, `--discard` (guest TRIM, which is what makes
+    compaction pay off), `--nonrotational` and `--hotpluggable`.
+  * Refuse to format a medium that has differencing children — a parent is
+    read-only and VirtualBox rejects the write.
+  * Deadline read-only VBoxManage calls, so a wedged VirtualBox service can
+    no longer strand the refresh chain and silently stop the window updating.
+
+ -- Vlad Ananyev <vlananyev@gmail.com>  Sun, 23 Aug 2026 00:00:00 +0000
+
+vboxfront (1.2.0) unstable; urgency=medium
+
+  * Resolve: rescue a medium VirtualBox can no longer read — re-point the
+    registry at a file that moved (`modifymedium --setlocation`), or check
+    and repair the image itself (`internalcommands repairhd`, dry run first).
+  * Image UUID tools: stamp a fresh UUID into a copied image so it can be
+    registered alongside the original, or reattach a differencing image to
+    its parent (`internalcommands sethduuid`/`sethdparentuuid`).
+  * Change an encryption password in one step, without decrypting first.
+  * Show the cipher and password ID of encrypted media in a new Encryption
+    column, and pre-select the medium's own cipher when re-keying.
+  * Per-tab totals: how much capacity is provisioned versus allocated.
+  * Command history with exit codes (File → Command history…), plus a
+    "Copy command" button on the output panel.
+  * Close the child's stdin once the payload is written, so a command that
+    reads it can no longer hang the panel indefinitely.
+
+ -- Vlad Ananyev <vlananyev@gmail.com>  Sat, 22 Aug 2026 00:00:00 +0000
+
+vboxfront (1.1.1) unstable; urgency=medium
+
+  * Fix disk encryption, which never worked: the "-" password placeholder
+    makes VBoxManage prompt on a terminal, so it failed on a pipe before
+    reading anything. Passwords now go through the "stdin" placeholder.
+  * Fix `list -l` parsing of multi-line descriptions, whose continuation
+    lines VBoxManage prints flush left: a description line shaped like
+    "UUID: ..." became the record's UUID and retargeted every later
+    operation at another medium, and a description containing a blank line
+    dropped the medium from the listing entirely.
+  * Convert and Import RAW no longer delete the target while the dialog is
+    still open, and refuse a target that is the source image itself.
+  * Warn before attaching to an occupied controller slot, which
+    storageattach silently replaces.
+  * Attach uses the medium type of the tab it was started from.
+  * Report the version in the window title and via --version.
+
+ -- Vlad Ananyev <vlananyev@gmail.com>  Sat, 22 Aug 2026 00:00:00 +0000
+
 vboxfront (1.1.0) unstable; urgency=medium
 
   * Media tabs (hard disks / DVDs / floppies) with diff-chain tree view.

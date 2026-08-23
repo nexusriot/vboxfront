@@ -9,14 +9,16 @@
 #   make clean         # remove build artifacts and .venv
 #   make VERSION=1.2.3 deb   # override the version string
 #
-# VERSION defaults to `git describe`; falls back to 1.0.0 outside a git
-# checkout. Exported so build scripts inherit it.
+# VERSION defaults to `git describe`, falling back to the source's own
+# APP_VERSION when the checkout has no tags (or is not a checkout at all).
+# Exported so build scripts inherit it.
 
 SHELL    := /usr/bin/env bash
 BUILD    := ./scripts/build.sh
 DEB      := ./scripts/build-deb.sh
 DIST     := dist
-VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo 1.0.0)
+APPVER   := $(shell sed -n 's/^APP_VERSION = "\(.*\)"/\1/p' vboxfront.py)
+VERSION  ?= $(shell git describe --tags --dirty 2>/dev/null || echo $(APPVER))
 export VERSION
 
 .DEFAULT_GOAL := build

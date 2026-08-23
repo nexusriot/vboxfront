@@ -23,9 +23,16 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
   human-readable sizes (`10.0 GB`), a live filter box (`Ctrl+F`),
   tooltips with the raw values, and red highlighting for *inaccessible*
   media.
-- **Create disk** — `createmedium` with format (VDI/VMDK/VHD), variant
-  (Standard/Fixed, Split2G for VMDK) and size.
-- **Attach / Detach** — `storageattach` against any registered VM; the
+- **Create disk** — `createmedium` with format, variant and size, both taken
+  from what VirtualBox reports it can create (see *Formats from VirtualBox*).
+- **Formats from VirtualBox** — the create and convert dialogs ask
+  `list hddbackends` which formats exist, which can be created, and which
+  variants each accepts, instead of hardcoding a list. QCOW, QED and
+  Parallels appear where they apply; read-only formats (DMG, VHDX) are never
+  offered as a target.
+- **Attach / Detach** — `storageattach` against any registered VM, with
+  optional `--mtype`, `--discard` (guest TRIM, which is what makes compaction
+  pay off), `--nonrotational` and `--hotpluggable`; the
   attach dialog reads the VM's controllers via
   `showvminfo --machinereadable`, pre-selects the first free port, and marks
   running VMs. Detach locates the right controller/port automatically.
@@ -38,18 +45,54 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
 - **Import RAW** — convert a raw `.img/.raw/.bin` into a managed format
   (`convertfromraw`); the result lands in the media library automatically.
 - **Properties** — change medium type
-  (normal/writethrough/immutable/shareable/readonly/multiattach) and
-  description (`modifymedium --type/--description`).
+  (normal/writethrough/immutable/shareable/readonly/multiattach), the
+  immutable auto-reset flag and the description
+  (`modifymedium --type/--autoreset/--description`). A differencing image's
+  type cannot be changed, and the dialog says so rather than letting
+  VirtualBox refuse it.
 - **Move** — relocate a disk file on disk (`modifymedium --move`).
-- **Encryption** — set or remove disk encryption (`encryptmedium`,
-  requires the VirtualBox Extension Pack). Passwords are passed via stdin,
-  never on the command line.
+- **Password check** — verify a medium's current password without changing
+  anything (`checkmediumpwd`).
+- **Encryption** — set, change or remove disk encryption (`encryptmedium`,
+  requires the VirtualBox Extension Pack). One password goes via stdin
+  (`--newpassword stdin`); changing a password needs two secrets in one call,
+  which stdin cannot carry, so those go through 0600 temp files that are
+  removed the moment the command exits. Neither ever reaches the command
+  line. The cipher and password ID of encrypted media are shown in the
+  listing's Encryption column.
 - **Remove** — unregister (`closemedium`), optionally deleting the backing
   file (`--delete`); defaults to the safe keep-file action.
+- **Resolve** — rescue a medium VirtualBox can no longer read: re-point the
+  registry at a file that moved (`modifymedium --setlocation`), or check and
+  repair the image itself (`internalcommands repairhd`, with a dry run
+  first). Relocation never touches the file, only the registry entry.
+- **Image UUID tools** — stamp a fresh UUID into a copied image so it can be
+  registered alongside the original, or reattach a differencing image to its
+  parent (`internalcommands sethduuid` / `sethdparentuuid`). This is the way
+  past *"a medium with the same UUID already exists"* after copying a `.vdi`.
+- **Contents** — read a byte range straight out of an image, with no VM, no
+  loop mount and no root (`mediumio cat`): hex dump it into the output panel
+  or extract it to a file. Goes through VirtualBox's own backend stack, so it
+  works on any supported format, on differencing chains, and on encrypted
+  media (which refuse to be read without their password).
+- **Differencing images** — create a child on top of an existing disk
+  (`createmedium --diffparent`); writes land in the child and the parent is
+  left alone. The listing already draws these chains as a tree.
+- **Format as FAT** — put a filesystem on a medium (`mediumio formatfat`), or
+  create a floppy image pre-formatted (`--variant Formatted`) so it is usable
+  without booting a VM first. Refused on a medium with differencing children,
+  which VirtualBox treats as read-only.
+- **Command history** — every command run, with its exit code, in
+  *File → Command history…*; copy one, all, or the current command line
+  straight from the output panel.
 - **Progress bar** — long operations (clone, compact, create) report live
   percentage parsed from VBoxManage's `0%...10%...` stream.
 - **Context menu** — copy UUID / location, open the containing folder, and
   all per-medium actions on right-click.
+- **Remembered layout** — window size and position (including which screen
+  and whether it was maximised), the output-panel splitter, the selected tab,
+  and each tab's column widths and order all come back next time. Columns are
+  resizable and reorderable, and auto-fit once on a first run.
 - **Settings** — custom `VBoxManage` location (useful when it is not on
   `PATH`) and management of the media library.
 - Live command output panel with a **Cancel** button; the media list
@@ -123,8 +166,11 @@ for the **host architecture**.
 
 ### Versioning
 
-`VERSION` defaults to `git describe` and falls back to `1.0.0` outside a git
-checkout. Override it explicitly:
+`APP_VERSION` in `vboxfront.py` is the single source of truth — it names the
+window title, `vboxfront --version`, the macOS bundle version and the fallback
+the build scripts use. `VERSION` prefers `git describe` when the checkout has
+tags, so a tagged build carries its tag (and `-dirty` when the tree is not
+clean). Override it explicitly:
 
 ```sh
 make VERSION=1.2.3 deb

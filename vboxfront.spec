@@ -2,8 +2,16 @@
 # PyInstaller spec file for vboxfront.
 # Build with: pyinstaller vboxfront.spec
 
+import pathlib
 import platform
+import re
 from PyInstaller.utils.hooks import collect_all
+
+# APP_VERSION is the single source of truth; read it rather than restating it
+# (the source cannot be imported here — importing it pulls in PyQt6).
+APP_VERSION = re.search(
+    r'^APP_VERSION = "([^"]+)"', pathlib.Path("vboxfront.py").read_text(), re.M
+).group(1)
 
 datas, binaries, hiddenimports = collect_all("PyQt6")
 
@@ -67,6 +75,6 @@ if platform.system() == "Darwin":
         bundle_identifier="com.example.vboxfront",
         info_plist={
             "NSHighResolutionCapable": True,
-            "CFBundleShortVersionString": "1.0.0",
+            "CFBundleShortVersionString": APP_VERSION,
         },
     )
