@@ -15,7 +15,7 @@ shell.
 
 ## Layout
 
-Everything lives in `vboxfront.py` (~1.8k lines), deliberately single-file:
+Everything lives in `vboxfront.py` (~5k lines), deliberately single-file:
 the tool is small, PyInstaller onefile packaging stays trivial, and there is
 no import graph to maintain. The file is ordered so that the pure,
 Qt-independent layer comes first and is importable by tests without a
@@ -24,11 +24,11 @@ display:
 | Section | Contents |
 |---|---|
 | Constants | `KIND_META` (disk/dvd/floppy nouns, list categories, attach types, file filters), formats/variants/types/ciphers, column indices |
-| Pure helpers | `parse_media_list`, `parse_machinereadable`, `parse_vms_list`, `find_attachment`, `find_free_port`, `parse_capacity_mb`, `format_mbytes`, arg builders (`create_disk_args`, `attach_args`, `encrypt_args`, …), QSettings library accessors |
+| Pure helpers | `parse_media_list`, `parse_machinereadable`, `parse_vms_list`, `parse_in_use_snapshot`, `parse_host_drives`, `find_attachment`, `find_free_port`, `controller_types`/`max_device_index`, `parse_capacity_mb`, `format_mbytes`/`format_bytes`, `free_bytes_for`/`space_warning`, `records_to_csv`/`_json`/`_tsv`, `scan_for_images`, `health_findings`, `is_destructive_command`/`rerun_blocker`, arg builders (`create_disk_args`, `attach_args`, `clone_args`, `resize_args`, `mediumproperty_args`, `encrypt_args`, …), QSettings library accessors |
 | Process runners | `CommandRunner` (visible, streaming), `CaptureRunner` (silent, buffered) |
-| Dialogs | `CreateDiskDialog`, `CreateDiffDialog`, `CreateFloppyDialog`, `ResizeDialog`, `ConvertDialog`, `ContentsDialog`, `RemoveDialog`, `ResolveDialog`, `UuidToolsDialog`, `PropertiesDialog`, `EncryptDialog`, `AttachDialog`, `SettingsDialog`, `CommandHistoryDialog` — all plain `QDialog` |
+| Dialogs | `CreateDiskDialog`, `CreateDiffDialog`, `CreateFloppyDialog`, `ResizeDialog`, `ConvertDialog`, `BatchConvertDialog`, `ContentsDialog`, `RemoveDialog`, `ResolveDialog`, `UuidToolsDialog`, `PropertiesDialog`, `MediumPropertyDialog`, `HealthDialog`, `OrphanScanDialog`, `EncryptDialog`, `AttachDialog`, `SettingsDialog`, `CommandHistoryDialog` — all plain `QDialog` |
 | Views | `MediumItem` (numeric-sorting tree item), `MediaPane` (one tab: tree + populate/filter/selection) |
-| Shell | `MainWindow` (actions/menus/toolbar, refresh chain, command queue, per-op flows) |
+| Shell | `MainWindow` (actions/menus/toolbar, refresh chain, command queue, drag-and-drop, per-op flows) |
 
 Command construction is centralised in the module-level `*_args` builders so
 tests can assert argv exactly and the UI code never assembles strings ad hoc.
@@ -112,11 +112,25 @@ the child dies with the app, and a half-written `clonemedium` target or a
 half-encrypted image is worth one prompt. Test tear-downs must therefore leave
 nothing running — an unmocked `QMessageBox` there blocks the whole suite.
 
-**Command queue.** Batch operations (Compact all VDIs) push
-`(args, stdin)` tuples onto `_cmd_queue`; `_on_runner_finished` pops the next
-on success and *drops the whole queue* on the first failure — a failed
-compact usually means something systemic (locked medium, missing binary),
-and silently continuing would hide it.
+**Command queue.** Batch operations (Compact all VDIs, and every action that
+takes a multi-selection) push `(args, stdin, follow-up)` tuples onto
+`_cmd_queue`; `_on_runner_finished` pops the next on success and *drops the
+whole queue* on the first failure — a failed compact usually means something
+systemic (locked medium, missing binary), and silently continuing would hide
+it.
+
+The third element is what makes a batch possible. Single operations used to
+park their bookkeeping in a shared `_pending_library_*` slot to be applied when
+"the" command succeeded; with a queue behind it, that slot is claimed by
+whichever command happens to finish, and a batch remove would prune the wrong
+library entry. Each command now carries its own follow-up, and
+`_run_queue()` is the single entry point that starts one.
+
+**Reading several VMs.** `_collect_vminfo()` walks a list of VM UUIDs one
+`showvminfo` at a time and hands over the lot. Sequential for the same reason
+the refresh chain is: there is one VBoxSVC, and a burst of clients against it
+is how the service gets wedged. Batch detach uses it — one dump per *VM*, not
+per attachment, since every medium's slot is in the same dump.
 
 ## Asking VirtualBox what it supports
 
@@ -270,6 +284,19 @@ VBoxFront therefore keeps its own **media library** — per-kind path lists in
 - Three `MediaPane` tabs (hard disks / DVDs / floppies). Disk-only actions
   (create, compact, resize, convert, properties, move, encrypt, import RAW)
   are disabled on the other tabs.
+- Selection is **extended**: compact, remove, detach and convert take whatever
+  is selected and queue one command per medium. `_require_selection_multi()`
+  falls back to the focused row when nothing is explicitly selected, so a
+  single click still works the way it always did. `populate()` restores a
+  multi-row selection across the refresh that follows each batch — losing it
+  there would mean re-picking the rows every time.
+- Batch remove sorts its targets into removable and blocked (attached to a VM,
+  or the parent of a differencing image) and says which is which, rather than
+  letting `closemedium` refuse half of them one error at a time.
+- The **Snapshot** column comes out of the same `In use by VMs` entry as the VM
+  name: `vm (UUID: …) [snap name (UUID: …)]`. The name was already in the
+  listing, so nothing extra is run for it — the match is anchored on the
+  trailing `(UUID: …)]` because a snapshot name can itself contain brackets.
 - The disk tree nests **differencing images** under their parents
   (`Parent UUID` chains; unknown parents fall back to top level, cycles are
   guarded). DVDs/floppies render flat.
@@ -295,6 +322,41 @@ VBoxFront therefore keeps its own **media library** — per-kind path lists in
   `VBOX_E_OBJECT_IN_USE`.
 - Selection is remembered by UUID across refreshes so chained operations
   keep their target.
+
+**Health, without running anything.** `health_findings()` is a pure function
+over the parsed registry: media VirtualBox cannot open, backing files that are
+gone while `State:` still says `created` (VBoxSVC caches it and only re-checks
+when something opens the medium), differencing images whose parent is not
+registered, encrypted media with no password ID. It deliberately stays quiet
+about the merely unusual so an empty result means something. The optional
+`repairhd -dry-run` pass is the one part that runs commands, and it only takes
+VDIs whose file is actually there — `-format` has to be told which format, and
+a wrong guess is a confusing error rather than a check.
+
+**Free space.** `space_warning()` compares `shutil.disk_usage` on the first
+existing parent of the target against `allocation_estimate()`: a dynamic image
+writes little more than a header, so only a Fixed one has to fit whole. It
+warns and never refuses — the estimate cannot know about compression, reflinks
+or a quota about to be raised. Checked before launching because VBoxManage does
+not reserve space up front: an image that will not fit fails somewhere in the
+middle and leaves a partial file behind.
+
+**Export.** CSV via the `csv` module rather than joins — a location or a
+description can contain the separator, and quoting it is not the caller's job.
+Sizes go out as plain megabyte numbers next to the formatted cells, because the
+point of exporting is to add them up somewhere else and "10.0 GB" does not sum.
+The TSV clipboard form flattens embedded tabs and newlines instead: it has no
+quoting layer, and a mangled cell is worse than a space. The export always
+covers the whole tab, never the filter — an export that silently dropped rows
+would be worse than none.
+
+**Re-running a command.** History stores the printed command line, so a replay
+has to be checked twice: `rerun_blocker()` refuses anything whose secret is
+gone (a `stdin` placeholder, or a `vboxfront-pw-` temp file that was shredded
+when the command exited) — replaying those hangs or fails — and
+`is_destructive_command()` decides whether confirmation is a button or the word
+RUN typed out. This is what makes the feature safe enough to ship after being
+deliberately left out of 1.2.0.
 
 ## Remembered UI state
 
@@ -324,6 +386,11 @@ Consequences worth knowing:
   listing, and only when nothing was restored.
 - The toolbar carries an `objectName`; `saveState()` skips — and warns about —
   any toolbar without one.
+
+Adding the Snapshot column changed the section count, so layouts saved by
+1.5.0 and earlier are refused by `QHeaderView::restoreState` and fall back to
+the one-off autosize. That is the documented behaviour of the fallback rather
+than a regression, and it costs one re-fit on the first run after upgrading.
 
 The window filter text is deliberately *not* persisted: starting up with rows
 hidden by a filter set days ago looks like missing media.
@@ -356,8 +423,18 @@ no display, no VirtualBox needed. `tests/__init__.py` points
   attach dialog runs against a canned `capture` callback.
 - `test_window.py` — `MainWindow` integration against a **fake VBoxManage
   shell script** that serves canned listings and logs every call: populate,
-  tree nesting, filter, inaccessible highlight, compact-all queue ordering,
-  library re-open calls, selection restore.
+  tree nesting, filter, inaccessible highlight, queue ordering and per-command
+  follow-ups, batch remove guards, library re-open calls, selection restore,
+  drops, export, health and orphan flows. The fixture lives in
+  `FakeVBoxManageTest`, which the suites inherit — subclassing a class that
+  *has* tests re-runs all of them once per suite.
+
+Two Qt traps the suite has already paid for: `QDropEvent` does not take
+ownership of its `QMimeData`, so a locally-built one is collected while the
+event still points at it (a segfault, not a failure); and patching a dialog's
+`exec` cannot fill in attributes the window reads, because `__init__` assigns
+them per instance and shadows the patched class attribute — the tests swap the
+whole dialog class for a stub instead.
 
 CI (`.github/workflows/ci.yml`) runs the suite and builds the `.deb`
 artifact on every push. A manual end-to-end pass against a real VirtualBox
@@ -383,8 +460,10 @@ cross-compile — binaries are host-arch only.
 
 | Limitation | Why / workaround |
 |---|---|
-| One VBoxManage command at a time | Serialised by design for transparency; batch compact queues sequentially |
+| One VBoxManage command at a time | Serialised by design for transparency; batches queue sequentially |
 | Change encryption password needs two steps | Two stdin secrets in one `encryptmedium` call is untested territory — decrypt, then encrypt |
-| No host DVD drive attach | Only image files are managed; use the VirtualBox GUI for host drives |
 | Library entries are paths, not UUIDs | A moved-outside-the-app file shows as a `[library] could not open` note; prune in Settings |
 | `list -l` refresh cost | One process per library entry + 3 list calls; fine for typical registries |
+| Create-time medium properties | `mediumproperty set` exits 0 and changes nothing for a property the backend only reads at creation (VDI's `AllocationBlockSize`); the dialog says so |
+| `repairhd -dry-run` sign-off | Prints "Corrupted VDI image repaired successfully" whatever it found, having written nothing; the verdict is the line above it |
+| Free-space estimates | A guess: they cannot know about compression, reflinks or a quota about to change, so they warn and never refuse |

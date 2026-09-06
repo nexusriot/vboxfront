@@ -12,12 +12,15 @@ what's left or new.
 - [x] **S** — Encrypt dialog: "Check password" button *(1.4.0)*.
 - [x] **S** — Persist column widths and order, sort order, the selected tab
       and window/splitter geometry in QSettings *(1.4.0)*.
-- [ ] **S** — Resize dialog: GB/MB unit selector and a target-size sanity
-      hint (current → new delta); `--resizebyte` allows exact sizes, and
-      `parse_byte_size()` already accepts hex and K/M/G suffixes.
-- [ ] **S** — Convert dialog: expose `clonemedium --variant` and `--existing`
-      (clone into a pre-created target). The per-format variant list is
-      already available from `list hddbackends`.
+- [x] **S** — Resize dialog: GB/MB unit selector and current → new delta,
+      plus an exact-size mode on `--resizebyte` *(1.6.0)*. Shrinking is
+      refused with a reason instead of a VirtualBox error. Note the unit
+      switch has to read the spin *before* narrowing its range: setRange
+      clamps first, which turned 25600 MB into 4 GB.
+- [x] **S** — Convert dialog: `clonemedium --variant` and `--existing`
+      *(1.6.0)*. `--existing` never goes through the overwrite path — the
+      target is the image being cloned *into*, and deleting it first would
+      destroy the thing the flag exists to use.
 - [x] **S** — One-step encryption password change *(1.2.0)*. Two secrets on
       one stdin stream do **not** work (the first `readPasswordFile("stdin")`
       swallows the buffered read; the second fails
@@ -27,13 +30,14 @@ what's left or new.
       used to leave `_refreshing` set forever, silencing every later refresh.
       Reproducible: `mediumio stream` deadlocks on 7.2.12 and wedges VBoxSVC
       until it is SIGKILLed — do not build anything on that subcommand.
-- [ ] **S** — Re-run a command from the history panel. Deliberately left out
-      of 1.2.0: replaying `closemedium --delete` from a list is too easy to do
-      by accident, so history only offers Copy for now.
-- [ ] **S** — Attach dialog: the device spin is always 0–1 regardless of
-      controller type (SATA only has device 0), so an impossible slot is only
-      caught by VBoxManage's error. Derive the range from
-      `storagecontrollertype<N>`.
+- [x] **S** — Re-run a command from the history panel *(1.6.0)*. Safe once
+      the two ways it goes wrong are closed off: a command whose secret went
+      over stdin or through a since-shredded temp file is refused outright
+      (it would hang or fail), and a destructive one needs the word RUN
+      typed rather than a default button pressed.
+- [x] **S** — Attach dialog: the device spin now comes from
+      `storagecontrollertype<N>` *(1.6.0)* — only IDE (PIIX3/PIIX4/ICH6) and
+      the floppy controller (I82078) address two devices per port.
 - [ ] **S** — The media library matches paths literally, so a `Location:`
       that VBoxManage reports differently from the stored path would leave
       Remove/Move unable to prune the entry and the medium would return on the
@@ -90,21 +94,47 @@ what's left or new.
 - [x] Per-tab totals: provisioned versus allocated.
 - [x] Command history with exit codes, plus Copy command.
 
+## Delivered in 1.6.0
+
+- [x] Multi-selection, and batch compact / remove / detach / convert.
+- [x] Media health report, with an optional read-only `repairhd -dry-run` pass.
+- [x] Scan for unregistered images; `mediumproperty` editor; snapshot column.
+- [x] Export the listing to CSV/JSON, and copy rows as TSV.
+- [x] Drag and drop images onto the window.
+- [x] Free-space preflight before create, resize and clone.
+- [x] Host drives, `emptydrive` and the Guest Additions ISO in the attach
+      dialog, with `--passthrough` / `--tempeject` / `--forceunmount`.
+- [x] Compact reports the space it actually reclaimed.
+
 ## Features
 
-- [ ] **M** — Orphan scan: walk user-chosen folders for `*.vdi/vmdk/vhd/iso`
-      not in the registry/library and offer bulk-adding them.
-- [ ] **M** — Multi-select: batch remove / batch compact of a selection
-      (the sequential queue infrastructure already exists).
-- [ ] **M** — Snapshot context: show which snapshot an attachment belongs to
-      (the `[snap (UUID: …)]` suffix is parsed but not displayed).
-- [ ] **S** — `mediumproperty` viewer/editor. Confirmed read/write on 7.2.12
-      (`mediumproperty [disk|dvd|floppy] get|set <medium> <name> [<value>]`),
-      the values are already captured into the record's raw block, and
-      `MediumBackend.properties` now supplies each format's schema (name,
-      type, default) to build the form from.
+- [x] **M** — Orphan scan *(1.6.0)*, comparing real paths so a symlinked VM
+      folder does not report every disk in it as an orphan.
+- [x] **M** — Multi-select: batch compact / remove / detach / convert
+      *(1.6.0)*. The queue entries grew a per-command follow-up — a single
+      shared pending slot cannot work for a batch, because it would be
+      claimed by whichever command happened to finish.
+- [x] **M** — Snapshot column *(1.6.0)*. No `snapshot list` call needed: the
+      name is already in the `[snap (UUID: …)]` suffix.
+- [x] **S** — `mediumproperty` viewer/editor *(1.6.0)*. Verified on 7.2.12:
+      `set` exits 0 on a create-time property (VDI's `AllocationBlockSize`)
+      and the value stays as it was, so the dialog says so rather than
+      leaving the user to wonder why nothing changed. The schema lookup has
+      to upper-case the format — `list -l` reports `vdi`, backend ids are
+      `VDI`.
 - [ ] **L** — Optional VM panel: list VMs with their storage trees, as an
-      alternate root view (media-per-VM instead of VM-per-media).
+      alternate root view (media-per-VM instead of VM-per-media). Most of the
+      parsing exists (`vm_storage_controllers`, `controller_types`,
+      `find_attachment`) — what is missing is the pane and the action routing.
+- [ ] **M** — Refresh cost: the chain is strictly sequential, one
+      `showmediuminfo` process per library entry plus three `list -l` calls.
+      Fine for a small library, visibly slow for a large one; the library
+      probes are read-only and could overlap, or be cached by mtime.
+- [ ] **S** — Elapsed time and an ETA on the progress bar, and a notification
+      when an operation that ran for more than half a minute finishes.
+- [ ] **M** — Split the single module into a package (`parsers`, `args`,
+      `dialogs`, `ui`). At ~4k lines it is at the edge of comfortable, and
+      every feature round makes the next one harder to place.
 
 ## Packaging / project
 

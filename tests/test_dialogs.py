@@ -7,11 +7,19 @@ import tempfile
 import unittest
 from unittest import mock
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QMessageBox, QSizePolicy
 
 from tests.test_parsing import HDDBACKENDS
 from vboxfront import (
     AttachDialog,
+    BatchConvertDialog,
+    CommandHistoryDialog,
+    HealthDialog,
+    MediumPropertyDialog,
+    OrphanScanDialog,
+    append_history,
+    clear_history,
     ContentsDialog,
     ElidingLabel,
     CreateDiffDialog,
@@ -753,6 +761,447 @@ class DialogTest(unittest.TestCase):
         self.assertEqual(vboxmanage_path(), "/opt/vbox/VBoxManage")
         get_settings().setValue("vboxmanage_path", "")
         save_library("dvd", [])
+
+
+IDE_VMINFO = """\
+storagecontrollername0="IDE"
+storagecontrollertype0="PIIX4"
+storagecontrollerportcount0="2"
+"IDE-0-0"="none"
+"IDE-0-1"="none"
+"IDE-1-0"="none"
+"IDE-1-1"="none"
+"""
+
+
+class ResizeDialogTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv[:1])
+
+    def test_gigabytes_keep_the_size_they_convert_from(self):
+        # setRange clamps before setValue, so a naive switch turned 25600 MB
+        # into 4096 MB and then into 4 GB.
+        dlg = ResizeDialog(record(capacity="25600 MBytes"))
+        self.assertEqual(dlg.spin.value(), 25600)
+        dlg.unit.setCurrentText("GB")
+        self.assertEqual(dlg.spin.value(), 25)
+        self.assertEqual(dlg.target_bytes(), 25600 * 1024 ** 2)
+        dlg.unit.setCurrentText("MB")
+        self.assertEqual(dlg.spin.value(), 25600)
+
+    def test_the_delta_names_the_growth(self):
+        dlg = ResizeDialog(record(capacity="1024 MBytes"))
+        dlg.spin.setValue(2048)
+        self.assertIn("+1.0 GB", dlg.delta.text())
+
+    def test_shrinking_is_refused_with_a_reason(self):
+        dlg = ResizeDialog(record(capacity="2048 MBytes"))
+        dlg.spin.setValue(1024)
+        self.assertIn("refuses to shrink", dlg.delta.text().lower()
+                      .replace("virtualbox only grows images", "refuses to shrink"))
+        with mock.patch.object(QMessageBox, "warning") as warn:
+            dlg._ok()
+        warn.assert_called_once()
+        self.assertEqual(dlg.result(), 0)
+
+    def test_the_same_size_is_not_a_command(self):
+        dlg = ResizeDialog(record(capacity="1024 MBytes"))
+        with mock.patch.object(QMessageBox, "information") as info:
+            dlg._ok()
+        info.assert_called_once()
+        self.assertEqual(dlg.result(), 0)
+
+    def test_an_exact_size_uses_resizebyte(self):
+        dlg = ResizeDialog(record(capacity="64 MBytes"))
+        dlg.exact_check.setChecked(True)
+        # Hex is how a partition table quotes an offset; this one is not a
+        # whole number of megabytes, which is exactly what --resize cannot say.
+        dlg.exact_edit.setText("0x6000200")
+        dlg._ok()
+        self.assertEqual(dlg.args("u"),
+                         ["modifymedium", "disk", "u", "--resizebyte", "100663808"])
+
+    def test_a_whole_megabyte_exact_size_still_uses_resize(self):
+        # --resizebyte exists for sizes --resize cannot express; a round one can
+        # go the ordinary way and stay readable in the history.
+        dlg = ResizeDialog(record(capacity="64 MBytes"))
+        dlg.exact_check.setChecked(True)
+        dlg.exact_edit.setText("128M")
+        dlg._ok()
+        self.assertEqual(dlg.args("u"),
+                         ["modifymedium", "disk", "u", "--resize", "128"])
+
+    def test_junk_is_rejected(self):
+        dlg = ResizeDialog(record(capacity="64 MBytes"))
+        dlg.exact_check.setChecked(True)
+        dlg.exact_edit.setText("about a gig")
+        with mock.patch.object(QMessageBox, "warning") as warn:
+            dlg._ok()
+        warn.assert_called_once()
+
+
+class ConvertVariantTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv[:1])
+
+    def test_variants_come_from_the_target_format(self):
+        backends = parse_hddbackends(HDDBACKENDS)
+        dlg = ConvertDialog(record(), backends)
+        dlg.fmt.setCurrentText("VMDK")
+        self.assertIn("Split2G", [dlg.variant.itemText(i)
+                                  for i in range(dlg.variant.count())])
+        dlg.fmt.setCurrentText("VDI")
+        self.assertNotIn("Split2G", [dlg.variant.itemText(i)
+                                     for i in range(dlg.variant.count())])
+
+    def test_the_chosen_variant_reaches_the_command(self):
+        dlg = ConvertDialog(record(), parse_hddbackends(HDDBACKENDS))
+        dlg.fmt.setCurrentText("VMDK")
+        dlg.variant.setCurrentText("Fixed")
+        dlg.path_edit.setText("/nonexistent/out.vmdk")
+        dlg._ok()
+        args = dlg.args("u")
+        self.assertEqual(args[-4:], ["--format", "VMDK", "--variant", "Fixed"])
+
+    def test_existing_requires_a_file_that_is_there(self):
+        dlg = ConvertDialog(record())
+        dlg.existing_check.setChecked(True)
+        dlg.path_edit.setText("/nonexistent/pre.vdi")
+        with mock.patch.object(QMessageBox, "warning") as warn:
+            dlg._ok()
+        warn.assert_called_once()
+        self.assertEqual(dlg.result(), 0)
+
+    def test_existing_never_deletes_the_target(self):
+        # --existing clones *into* the file; treating it as an overwrite target
+        # would delete the very image being cloned into.
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "pre.vdi")
+            with open(target, "w") as f:
+                f.write("pre-allocated")
+            dlg = ConvertDialog(record())
+            dlg.existing_check.setChecked(True)
+            dlg.path_edit.setText(target)
+            dlg._ok()
+            self.assertFalse(dlg.overwrite)
+            self.assertTrue(dlg.existing)
+            self.assertTrue(os.path.exists(target))
+            self.assertEqual(dlg.args("u"),
+                             ["clonemedium", "disk", "u", target, "--existing"])
+
+
+class MediumPropertyDialogTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv[:1])
+
+    def _dialog(self, **overrides):
+        rec = record(properties=["AllocationBlockSize=1048576"], **overrides)
+        return MediumPropertyDialog("disk", rec, parse_hddbackends(HDDBACKENDS))
+
+    def test_values_come_from_the_listing_not_a_command(self):
+        dlg = self._dialog()
+        self.assertEqual(dlg._edits["AllocationBlockSize"].text(), "1048576")
+
+    def test_the_schema_lookup_survives_a_lowercase_format(self):
+        # `list -l` reports "vdi" while backend ids are upper case; matching
+        # literally left every field without its type and default.
+        dlg = self._dialog(fmt="vdi")
+        self.assertIn("AllocationBlockSize", dlg._edits)
+
+    def test_an_unchanged_field_produces_no_command(self):
+        self.assertEqual(self._dialog().commands(), [])
+
+    def test_a_changed_value_is_set(self):
+        dlg = self._dialog()
+        dlg._edits["AllocationBlockSize"].setText("2097152")
+        self.assertEqual(
+            dlg.commands(),
+            [["mediumproperty", "disk", "set", record().uuid,
+              "AllocationBlockSize", "2097152"]],
+        )
+
+    def test_clearing_a_set_value_deletes_it(self):
+        dlg = self._dialog()
+        dlg._edits["AllocationBlockSize"].setText("")
+        self.assertEqual(dlg.commands()[0][3:], [record().uuid, "AllocationBlockSize"])
+        self.assertEqual(dlg.commands()[0][2], "delete")
+
+    def test_clearing_a_field_that_was_never_set_does_nothing(self):
+        dlg = MediumPropertyDialog("disk", record(properties=[]),
+                                   parse_hddbackends(HDDBACKENDS))
+        for edit in dlg._edits.values():
+            edit.setText("")
+        self.assertEqual(dlg.commands(), [])
+
+
+class BatchConvertDialogTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv[:1])
+
+    def _disks(self, folder):
+        return [
+            record(uuid="1" * 8, location=os.path.join(folder, "a.vdi")),
+            record(uuid="2" * 8, location=os.path.join(folder, "b.vdi")),
+        ]
+
+    def test_targets_are_derived_per_source(self):
+        with tempfile.TemporaryDirectory() as d:
+            dlg = BatchConvertDialog(self._disks(d), parse_hddbackends(HDDBACKENDS))
+            dlg.fmt.setCurrentText("VMDK")
+            self.assertEqual(
+                [t for _s, t in dlg._plan()],
+                [os.path.join(d, "a-converted.vmdk"), os.path.join(d, "b-converted.vmdk")],
+            )
+
+    def test_a_suffix_that_collides_with_the_source_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            disks = self._disks(d)
+            for disk in disks:
+                with open(disk.location, "w") as f:
+                    f.write("x")
+            dlg = BatchConvertDialog(disks, parse_hddbackends(HDDBACKENDS))
+            dlg.fmt.setCurrentText("VDI")
+            dlg.suffix.setText("")
+            with mock.patch.object(QMessageBox, "warning") as warn:
+                dlg._ok()
+            warn.assert_called_once()
+            self.assertIn("source", warn.call_args[0][2])
+            self.assertTrue(all(os.path.exists(d_.location) for d_ in disks))
+
+    def test_two_sources_may_not_share_one_target(self):
+        with tempfile.TemporaryDirectory() as d:
+            disks = [record(uuid="1" * 8, location=os.path.join(d, "sub1", "a.vdi")),
+                     record(uuid="2" * 8, location=os.path.join(d, "sub2", "a.vdi"))]
+            dlg = BatchConvertDialog(disks, parse_hddbackends(HDDBACKENDS))
+            dlg.dir_edit.setText(d)
+            with mock.patch.object(QMessageBox, "warning") as warn:
+                dlg._ok()
+            warn.assert_called_once()
+            self.assertIn("same target", warn.call_args[0][2])
+
+    def test_commands_carry_the_format_and_variant(self):
+        with tempfile.TemporaryDirectory() as d:
+            dlg = BatchConvertDialog(self._disks(d), parse_hddbackends(HDDBACKENDS))
+            dlg.fmt.setCurrentText("VMDK")
+            dlg.variant.setCurrentText("Fixed")
+            dlg._ok()
+            commands = dlg.commands()
+            self.assertEqual(len(commands), 2)
+            self.assertEqual(commands[0][:2], ["clonemedium", "disk"])
+            self.assertEqual(commands[0][-4:], ["--format", "VMDK", "--variant", "Fixed"])
+
+
+class HealthDialogTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv[:1])
+
+    def test_a_clean_registry_says_so(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ok.vdi")
+            with open(path, "w") as f:
+                f.write("x")
+            dlg = HealthDialog({"disk": [record(location=path)], "dvd": [], "floppy": []})
+            self.assertIn("no problems found", dlg._summary().lower())
+
+    def test_problems_are_counted_by_severity(self):
+        dlg = HealthDialog({"disk": [record(state="inaccessible")], "dvd": [], "floppy": []})
+        self.assertIn("error", dlg._summary())
+        self.assertTrue(dlg.list.count())
+
+    def test_the_dry_run_only_offers_readable_vdis(self):
+        with tempfile.TemporaryDirectory() as d:
+            here = os.path.join(d, "here.vdi")
+            with open(here, "w") as f:
+                f.write("x")
+            media = {
+                "disk": [record(location=here),
+                         record(uuid="2" * 8, location=os.path.join(d, "gone.vdi")),
+                         record(uuid="3" * 8, fmt="VMDK",
+                                location=os.path.join(d, "other.vmdk"))],
+                "dvd": [], "floppy": [],
+            }
+            dlg = HealthDialog(media)
+            with mock.patch.object(QMessageBox, "question",
+                                   return_value=QMessageBox.StandardButton.Yes):
+                dlg._start_dry_run()
+            self.assertEqual(dlg.dry_run_paths, [here])
+
+    def test_the_dry_run_caveat_names_the_misleading_line(self):
+        # 7.2.12 signs off with "Corrupted VDI image repaired successfully"
+        # even on a clean image it never wrote to.
+        self.assertIn("repaired successfully", HealthDialog.dry_run_caveat())
+
+
+class OrphanScanDialogTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv[:1])
+
+    def test_scanning_lists_only_unknown_images(self):
+        with tempfile.TemporaryDirectory() as d:
+            known = os.path.join(d, "known.vdi")
+            orphan = os.path.join(d, "orphan.vdi")
+            for path in (known, orphan):
+                with open(path, "w") as f:
+                    f.write("x")
+            dlg = OrphanScanDialog([known])
+            dlg.folders.clear()
+            dlg.folders.addItem(d)
+            dlg._scan()
+            self.assertEqual(dlg.results.count(), 1)
+            self.assertIn("orphan.vdi", dlg.results.item(0).text())
+
+    def test_only_checked_rows_are_returned(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("a.vdi", "b.iso"):
+                with open(os.path.join(d, name), "w") as f:
+                    f.write("x")
+            dlg = OrphanScanDialog([])
+            dlg.folders.clear()
+            dlg.folders.addItem(d)
+            dlg._scan()
+            dlg._set_all(False)
+            dlg.results.item(0).setCheckState(Qt.CheckState.Checked)
+            dlg._ok()
+            self.assertEqual(len(dlg.chosen), 1)
+            kind, path = dlg.chosen[0]
+            self.assertEqual(kind, "disk" if path.endswith(".vdi") else "dvd")
+
+
+class RemoveBatchTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv[:1])
+
+    def test_one_medium_still_shows_its_details(self):
+        dlg = RemoveDialog(record())
+        self.assertEqual(dlg.windowTitle(), "Remove medium")
+
+    def test_many_media_are_listed_and_the_delete_warning_counts_them(self):
+        media = [record(uuid="1" * 8), record(uuid="2" * 8, location="/vms/two.vdi")]
+        dlg = RemoveDialog(media)
+        self.assertEqual(dlg.windowTitle(), "Remove media")
+        dlg.mode.setCurrentIndex(1)
+        with mock.patch.object(QMessageBox, "warning",
+                               return_value=QMessageBox.StandardButton.No) as warn:
+            dlg._ok()
+        self.assertIn("2 disk image files", warn.call_args[0][2])
+        self.assertFalse(dlg.delete_file, "declining the warning still armed --delete")
+
+
+class HistoryRerunTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv[:1])
+
+    def setUp(self):
+        clear_history()
+
+    def tearDown(self):
+        clear_history()
+
+    def _dialog(self, command):
+        append_history(command, 0, "2026-01-01 00:00:00")
+        dlg = CommandHistoryDialog()
+        dlg.list.setCurrentRow(0)
+        return dlg
+
+    def test_a_harmless_command_is_confirmed_once(self):
+        dlg = self._dialog("VBoxManage modifymedium disk u --compact")
+        with mock.patch.object(QMessageBox, "question",
+                               return_value=QMessageBox.StandardButton.Yes):
+            dlg._rerun_selected()
+        self.assertEqual(dlg.rerun, ["modifymedium", "disk", "u", "--compact"])
+
+    def test_a_destructive_command_needs_the_word_typed(self):
+        dlg = self._dialog("VBoxManage closemedium disk u --delete")
+        with mock.patch("vboxfront.QInputDialog.getText", return_value=("", True)):
+            dlg._rerun_selected()
+        self.assertIsNone(dlg.rerun, "an empty confirmation replayed a --delete")
+        with mock.patch("vboxfront.QInputDialog.getText", return_value=("RUN", True)):
+            dlg._rerun_selected()
+        self.assertEqual(dlg.rerun, ["closemedium", "disk", "u", "--delete"])
+
+    def test_a_command_whose_secret_is_gone_is_refused(self):
+        dlg = self._dialog("VBoxManage encryptmedium u --newpassword stdin")
+        with mock.patch.object(QMessageBox, "warning") as warn:
+            dlg._rerun_selected()
+        warn.assert_called_once()
+        self.assertIsNone(dlg.rerun)
+
+
+class AttachSlotsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv[:1])
+
+    def test_sata_offers_no_second_device(self):
+        dlg = AttachDialog(
+            "disk", record(),
+            vms=[("vm1", "24aa0bbd-3d9c-4ba3-a41f-273c0ab57661")],
+            running=set(), capture=lambda args, cb: cb(0, VMINFO),
+        )
+        self.assertEqual(dlg.device_spin.maximum(), 0)
+
+    def test_ide_offers_master_and_slave(self):
+        dlg = AttachDialog(
+            "disk", record(),
+            vms=[("vm1", "24aa0bbd-3d9c-4ba3-a41f-273c0ab57661")],
+            running=set(), capture=lambda args, cb: cb(0, IDE_VMINFO),
+        )
+        self.assertEqual(dlg.device_spin.maximum(), 1)
+
+    def test_a_dvd_can_be_pointed_at_an_empty_or_host_drive(self):
+        def capture(args, cb):
+            cb(0, "UUID: aaaa\nName: /dev/sr0\n" if args[:2] == ["list", "hostdvds"]
+               else IDE_VMINFO)
+            return True
+
+        dlg = AttachDialog(
+            "dvd", record(location="/isos/boot.iso"),
+            vms=[("vm1", "24aa0bbd-3d9c-4ba3-a41f-273c0ab57661")],
+            running=set(), capture=capture,
+        )
+        options = [dlg.medium_combo.itemData(i) for i in range(dlg.medium_combo.count())]
+        self.assertIn("emptydrive", options)
+        self.assertIn("additions", options)
+        self.assertIn("host:/dev/sr0", options)
+        dlg.medium_combo.setCurrentIndex(options.index("host:/dev/sr0"))
+        # Passthrough only means anything for a real drive.
+        self.assertTrue(dlg.passthrough_check.isEnabled())
+        dlg.passthrough_check.setChecked(True)
+        args = dlg.args()
+        self.assertIn("host:/dev/sr0", args)
+        self.assertIn("--passthrough", args)
+
+    def test_passthrough_is_dropped_for_an_image(self):
+        def capture(args, cb):
+            cb(0, "" if args[:2] == ["list", "hostdvds"] else IDE_VMINFO)
+            return True
+
+        dlg = AttachDialog(
+            "dvd", record(location="/isos/boot.iso"),
+            vms=[("vm1", "24aa0bbd-3d9c-4ba3-a41f-273c0ab57661")],
+            running=set(), capture=capture,
+        )
+        self.assertFalse(dlg.passthrough_check.isEnabled())
+        self.assertNotIn("--passthrough", dlg.args())
+
+    def test_a_disk_attach_is_unchanged(self):
+        dlg = AttachDialog(
+            "disk", record(),
+            vms=[("vm1", "24aa0bbd-3d9c-4ba3-a41f-273c0ab57661")],
+            running=set(), capture=lambda args, cb: cb(0, VMINFO),
+        )
+        args = dlg.args()
+        self.assertIn(record().uuid, args)
+        for flag in ("--passthrough", "--tempeject", "--forceunmount"):
+            self.assertNotIn(flag, args)
 
 
 if __name__ == "__main__":

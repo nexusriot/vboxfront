@@ -9,6 +9,12 @@ import unittest
 from vboxfront import (
     APP_VERSION,
     PASSWORD_STDIN,
+    clone_args,
+    is_destructive_command,
+    mediumproperty_args,
+    rerun_args,
+    rerun_blocker,
+    resize_args,
     get_settings,
     attach_args,
     check_password_args,
@@ -231,6 +237,120 @@ class VersionTest(unittest.TestCase):
             text = (self.root / name).read_text()
             self.assertNotIn(APP_VERSION, text, f"{name} restates the version")
             self.assertIn("APP_VERSION", text, f"{name} does not read APP_VERSION")
+
+
+class NewArgBuildersTest(unittest.TestCase):
+    def test_clone_carries_format_and_variant(self):
+        self.assertEqual(
+            clone_args("disk", "u", "/out.vmdk", fmt="VMDK", variant="Fixed"),
+            ["clonemedium", "disk", "u", "/out.vmdk", "--format", "VMDK",
+             "--variant", "Fixed"],
+        )
+
+    def test_clone_omits_the_standard_variant(self):
+        self.assertNotIn("--variant", clone_args("disk", "u", "/o.vdi",
+                                                 fmt="VDI", variant="Standard"))
+
+    def test_clone_into_an_existing_image_sends_no_geometry(self):
+        # --existing keeps the target's own format and variant; sending either
+        # is at best redundant and at worst a conflict.
+        args = clone_args("disk", "u", "/pre.vdi", existing=True)
+        self.assertEqual(args,
+                         ["clonemedium", "disk", "u", "/pre.vdi", "--existing"])
+
+    def test_mediumproperty_get_set_delete(self):
+        self.assertEqual(
+            mediumproperty_args("disk", "u", "get", "AllocationBlockSize"),
+            ["mediumproperty", "disk", "get", "u", "AllocationBlockSize"],
+        )
+        self.assertEqual(
+            mediumproperty_args("disk", "u", "set", "AllocationBlockSize", "2097152"),
+            ["mediumproperty", "disk", "set", "u", "AllocationBlockSize", "2097152"],
+        )
+        # delete takes no value, and must not be handed an empty one.
+        self.assertEqual(
+            mediumproperty_args("dvd", "u", "delete", "Foo"),
+            ["mediumproperty", "dvd", "delete", "u", "Foo"],
+        )
+
+    def test_resize_prefers_megabytes(self):
+        self.assertEqual(resize_args("u", size_mb=2048),
+                         ["modifymedium", "disk", "u", "--resize", "2048"])
+
+    def test_resize_exact_uses_resizebyte(self):
+        # --resize only speaks whole megabytes; anything else has to go through
+        # --resizebyte or be silently rounded.
+        self.assertEqual(
+            resize_args("u", size_bytes=100663296),
+            ["modifymedium", "disk", "u", "--resizebyte", "100663296"],
+        )
+
+    def test_attach_optical_flags(self):
+        args = attach_args("vm", "IDE", 1, 0, "dvd", "host:/dev/sr0",
+                           passthrough=True, tempeject=True, forceunmount=True)
+        self.assertIn("host:/dev/sr0", args)
+        self.assertEqual(args[args.index("--passthrough") + 1], "on")
+        self.assertEqual(args[args.index("--tempeject") + 1], "on")
+        # --forceunmount is a bare switch, not an on/off pair.
+        self.assertIn("--forceunmount", args)
+        self.assertNotIn("on", args[args.index("--forceunmount") + 1:])
+
+    def test_attach_keeps_the_short_form_by_default(self):
+        args = attach_args("vm", "IDE", 0, 0, "dvd", "m")
+        for flag in ("--passthrough", "--tempeject", "--forceunmount"):
+            self.assertNotIn(flag, args)
+
+
+class RerunSafetyTest(unittest.TestCase):
+    def test_destructive_commands_are_recognised(self):
+        for command in (
+            "VBoxManage closemedium disk u --delete",
+            "VBoxManage modifymedium disk u --resize 2048",
+            "VBoxManage modifymedium disk u --move /elsewhere.vdi",
+            "VBoxManage encryptmedium u --oldpassword /tmp/x",
+            "VBoxManage internalcommands repairhd -format VDI /a.vdi",
+            "VBoxManage internalcommands sethduuid /a.vdi",
+            "VBoxManage storageattach vm --storagectl IDE --medium none",
+        ):
+            self.assertTrue(is_destructive_command(command), command)
+
+    def test_read_only_commands_are_not(self):
+        for command in (
+            "VBoxManage list -l hdds",
+            "VBoxManage showmediuminfo disk u",
+            "VBoxManage modifymedium disk u --compact",
+            "VBoxManage internalcommands repairhd -dry-run -format VDI /a.vdi",
+        ):
+            self.assertFalse(is_destructive_command(command), command)
+
+    def test_a_command_whose_secret_is_gone_cannot_be_replayed(self):
+        # The password went over stdin and was never stored; replaying this
+        # would block on an input that never comes.
+        self.assertTrue(rerun_blocker(
+            "VBoxManage encryptmedium u --newpassword stdin --newpasswordid k"))
+        self.assertTrue(rerun_blocker(
+            "VBoxManage mediumio --disk=u --password-file=stdin cat"))
+        # And the two-secret form read files that were shredded on exit.
+        self.assertTrue(rerun_blocker(
+            "VBoxManage encryptmedium u --oldpassword /tmp/vboxfront-pw-ab12"))
+
+    def test_ordinary_commands_have_no_blocker(self):
+        self.assertEqual(rerun_blocker("VBoxManage modifymedium disk u --compact"), "")
+
+    def test_rerun_drops_the_binary_path(self):
+        self.assertEqual(
+            rerun_args("/usr/bin/VBoxManage modifymedium disk u --compact"),
+            ["modifymedium", "disk", "u", "--compact"],
+        )
+        # A quoted path with spaces survives the round trip.
+        self.assertEqual(
+            rerun_args("'/opt/VirtualBox 7/VBoxManage' list -l hdds"),
+            ["list", "-l", "hdds"],
+        )
+
+    def test_rerun_rejects_junk(self):
+        self.assertIsNone(rerun_args(""))
+        self.assertIsNone(rerun_args("'unbalanced"))
 
 
 if __name__ == "__main__":

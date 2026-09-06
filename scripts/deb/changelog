@@ -1,9 +1,59 @@
-vboxfront (1.5.0) UNRELEASED; urgency=medium
+vboxfront (1.7.0) UNRELEASED; urgency=medium
 
   * Development version; no changes yet. Change the distribution to
     "unstable" once this release has something in it.
 
- -- Vlad Ananyev <vlananyev@gmail.com>  Sun, 23 Aug 2026 00:00:00 +0000
+ -- Vlad Ananyev <vlananyev@gmail.com>  Sat, 06 Sep 2026 00:00:00 +0000
+
+vboxfront (1.6.0) unstable; urgency=medium
+
+  * Multi-selection. The media list now takes more than one row, and Compact,
+    Remove, Detach and Convert all act on the selection. Batches run one
+    command after another and stop at the first failure, as Compact all
+    already did.
+  * Batch convert: clone several disks into one folder in a single queued run,
+    with the target names previewed before anything starts.
+  * Format properties (`mediumproperty`): view and edit a medium's
+    format-specific properties. Values come from the listing that is already
+    on screen and the names from the format's own schema, so nothing extra is
+    run to open the dialog. Note that some properties are only read when the
+    image is created — VDI's AllocationBlockSize among them: the command
+    succeeds and the value stays as it was.
+  * Media health: everything wrong with the registry that can be seen without
+    running a command — media VirtualBox cannot open, backing files that have
+    gone missing while the registry still says they are fine, differencing
+    images whose parent is not registered — plus an optional read-only
+    `repairhd -dry-run` pass over the VDIs.
+  * Scan for unregistered images: walk chosen folders for image files that
+    neither VirtualBox nor the library knows about, and add the ones you pick.
+  * Export the listing to CSV or JSON, and copy selected rows as TSV. Sizes go
+    out as plain megabyte numbers as well as formatted cells, so they can be
+    added up somewhere else.
+  * Snapshot column: which snapshot an attachment belongs to. The name was
+    already in the listing and had never been shown.
+  * Drag and drop image files onto the window to add them to the library; a
+    dropped raw image offers Import RAW instead.
+  * Free-space preflight before create, resize and clone: the target
+    filesystem's free space against what the operation will actually take,
+    live in the dialog and once more as a confirmation. VBoxManage does not
+    reserve space up front, so a target that does not fit fails part-way and
+    leaves a partial file behind.
+  * Resize: MB/GB unit selector, a current → new delta, an exact-size mode
+    (`--resizebyte`, which takes hex and K/M/G suffixes), and a refusal with a
+    reason rather than a VirtualBox error when asked to shrink.
+  * Convert: choose the target variant (fixed, split) as well as the format,
+    and clone into a pre-created image with `--existing`.
+  * Attach: the device number now comes from the controller type, so only IDE
+    and floppy controllers offer a second device. DVD and floppy attachments
+    can point at an empty drive, the Guest Additions ISO or a host drive, with
+    `--passthrough`, `--tempeject` and `--forceunmount`.
+  * Compact now reports what it actually reclaimed, measured across the
+    refresh that follows it.
+  * Re-run a command from the history. Refused outright when its password went
+    over stdin or through a temp file that no longer exists; destructive
+    commands need the word RUN typed, not a default button.
+
+ -- Vlad Ananyev <vlananyev@gmail.com>  Sat, 06 Sep 2026 00:00:00 +0000
 
 vboxfront (1.4.0) unstable; urgency=medium
 

@@ -1,9 +1,28 @@
 """Parser tests against real VBoxManage 7.2.12 output samples."""
 
+import json
+import os
+import tempfile
 import unittest
 
 from vboxfront import (
     CAP_DIFFERENCING,
+    allocation_estimate,
+    controller_types,
+    format_bytes,
+    free_bytes_for,
+    health_findings,
+    health_report,
+    max_device_index,
+    parse_host_drives,
+    parse_in_use_snapshot,
+    reclaim_line,
+    records_to_csv,
+    records_to_json,
+    records_to_tsv,
+    scan_for_images,
+    snapshot_word,
+    space_warning,
     child_names,
     disk_backends,
     encryption_word,
@@ -528,6 +547,246 @@ class VmParsingTest(unittest.TestCase):
         # The fallback is port 0 and it is *not* free — callers must check.
         self.assertEqual(find_free_port(info, "SATA Controller", 4), 0)
         self.assertTrue(slot_occupant(info, "SATA Controller", 0, 0))
+
+
+SNAPSHOT_LISTING = """\
+UUID:           11111111-1111-1111-1111-111111111111
+Parent UUID:    base
+State:          created
+Type:           normal (base)
+Location:       /vms/snap.vdi
+Storage format: VDI
+Capacity:       1024 MBytes
+Size on disk:   64 MBytes
+Property:       AllocationBlockSize=1048576
+In use by VMs:  win11 (UUID: 22222222-2222-2222-2222-222222222222) [Before update (UUID: 33333333-3333-3333-3333-333333333333)]
+"""
+
+
+class SnapshotParsingTest(unittest.TestCase):
+    def test_snapshot_name_comes_out_of_the_listing(self):
+        # No `snapshot list` call is needed: the name is already there.
+        entry = ("win11 (UUID: 22222222-2222-2222-2222-222222222222) "
+                 "[Before update (UUID: 33333333-3333-3333-3333-333333333333)]")
+        self.assertEqual(parse_in_use_snapshot(entry), "Before update")
+        self.assertEqual(parse_in_use_entry(entry)[0], "win11")
+
+    def test_a_snapshot_name_may_contain_brackets(self):
+        entry = ("vm (UUID: 22222222-2222-2222-2222-222222222222) "
+                 "[clean (v2) [rc] (UUID: 33333333-3333-3333-3333-333333333333)]")
+        self.assertEqual(parse_in_use_snapshot(entry), "clean (v2) [rc]")
+
+    def test_an_attachment_without_a_snapshot_reports_none(self):
+        self.assertEqual(
+            parse_in_use_snapshot("vm (UUID: 22222222-2222-2222-2222-222222222222)"),
+            "",
+        )
+
+    def test_snapshot_word_deduplicates(self):
+        rec = parse_media_list(SNAPSHOT_LISTING)[0]
+        rec.in_use = rec.in_use * 2
+        self.assertEqual(snapshot_word(rec), "Before update")
+
+    def test_properties_are_captured(self):
+        rec = parse_media_list(SNAPSHOT_LISTING)[0]
+        self.assertEqual(rec.properties, ["AllocationBlockSize=1048576"])
+
+    def test_wrapped_property_block_yields_one_entry_per_property(self):
+        # The long listing's VMDK carries four properties; a repeat of the same
+        # label continues the field rather than opening a new one, so the label
+        # has to be trimmed back off each continuation.
+        vmdk = next(r for r in parse_media_list(HDDS_LONG) if r.fmt == "VMDK")
+        self.assertIn("BootSector=", vmdk.properties)
+        self.assertTrue(all(not p.startswith("Property:") for p in vmdk.properties))
+
+
+class HostDriveTest(unittest.TestCase):
+    def test_names_are_taken_from_the_listing(self):
+        text = ("UUID:         aaaa\nName:         /dev/sr0\n\n"
+                "UUID:         bbbb\nName:         /dev/sr1\n")
+        self.assertEqual(parse_host_drives(text), ["/dev/sr0", "/dev/sr1"])
+
+    def test_no_drives_is_not_an_error(self):
+        # `list hostdvds` is empty on a machine with no optical drive, and on
+        # one where this user cannot enumerate them.
+        self.assertEqual(parse_host_drives(""), [])
+
+
+class ControllerTypeTest(unittest.TestCase):
+    def test_types_are_paired_with_names(self):
+        info = parse_machinereadable(
+            'storagecontrollername0="IDE"\nstoragecontrollertype0="PIIX4"\n'
+            'storagecontrollername1="SATA"\nstoragecontrollertype1="IntelAhci"\n'
+        )
+        self.assertEqual(controller_types(info), {"IDE": "PIIX4", "SATA": "IntelAhci"})
+
+    def test_only_ide_and_floppy_have_a_second_device(self):
+        for ctype in ("PIIX3", "PIIX4", "ICH6", "I82078", "piix4"):
+            self.assertEqual(max_device_index(ctype), 1, ctype)
+        for ctype in ("IntelAhci", "LsiLogic", "USB", "NVMe", "VirtioSCSI", ""):
+            self.assertEqual(max_device_index(ctype), 0, ctype)
+
+
+class ExportTest(unittest.TestCase):
+    def setUp(self):
+        self.records = parse_media_list(SNAPSHOT_LISTING)
+
+    def test_csv_has_a_header_and_numeric_sizes(self):
+        lines = records_to_csv(self.records).splitlines()
+        self.assertTrue(lines[0].startswith("name,format,capacity_mb,size_on_disk_mb"))
+        # Numbers, not "1.0 GB": the point of exporting is to add them up.
+        self.assertIn(",1024,64,", lines[1])
+
+    def test_csv_quotes_a_value_containing_the_separator(self):
+        self.records[0].description = "a, b"
+        self.records[0].location = "/vms/a,b.vdi"
+        self.assertIn('"/vms/a,b.vdi"', records_to_csv(self.records))
+
+    def test_json_round_trips(self):
+        rows = json.loads(records_to_json(self.records))
+        self.assertEqual(rows[0]["uuid"], "11111111-1111-1111-1111-111111111111")
+        self.assertEqual(rows[0]["snapshot"], "Before update")
+        self.assertEqual(rows[0]["capacity_mb"], 1024)
+
+    def test_tsv_flattens_embedded_tabs_and_newlines(self):
+        self.records[0].access_error = "line one\nline two"
+        body = records_to_tsv(self.records).splitlines()[1]
+        self.assertIn("line one line two", body)
+        self.assertEqual(len(body.split("\t")),
+                         len(records_to_tsv(self.records).splitlines()[0].split("\t")))
+
+    def test_missing_sizes_export_as_empty_not_none(self):
+        self.records[0].capacity = ""
+        self.assertNotIn("None", records_to_csv(self.records))
+
+
+class SpaceTest(unittest.TestCase):
+    def test_format_bytes(self):
+        self.assertEqual(format_bytes(512), "512 B")
+        self.assertEqual(format_bytes(1536), "1.5 KB")
+        self.assertEqual(format_bytes(3 * 1024 ** 3), "3.0 GB")
+        self.assertEqual(format_bytes(None), "")
+
+    def test_free_space_walks_up_to_a_folder_that_exists(self):
+        with tempfile.TemporaryDirectory() as d:
+            deep = os.path.join(d, "not", "there", "yet", "disk.vdi")
+            self.assertIsInstance(free_bytes_for(deep), int)
+
+    def test_only_a_fixed_image_has_to_fit_whole(self):
+        self.assertGreater(allocation_estimate(1024, "Fixed"), 1024 * 1024 ** 2)
+        self.assertLessEqual(allocation_estimate(1024, "Standard"), 8 * 1024 ** 2)
+
+    def test_a_fitting_target_produces_no_warning(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(space_warning(os.path.join(d, "x.vdi"), 1024), "")
+
+    def test_an_impossible_target_is_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            warning = space_warning(os.path.join(d, "x.vdi"), 10 ** 18)
+            self.assertIn("free", warning)
+
+    def test_nothing_needed_is_never_a_warning(self):
+        self.assertEqual(space_warning("/nonexistent/x.vdi", 0), "")
+
+
+class OrphanScanTest(unittest.TestCase):
+    def test_only_unknown_images_are_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            known = os.path.join(d, "known.vdi")
+            orphan = os.path.join(d, "sub", "orphan.vmdk")
+            iso = os.path.join(d, "boot.iso")
+            os.makedirs(os.path.dirname(orphan))
+            for path in (known, orphan, iso, os.path.join(d, "notes.txt")):
+                with open(path, "w") as f:
+                    f.write("x")
+            found = scan_for_images([d], [known])
+            self.assertEqual(found, [("dvd", iso), ("disk", orphan)]
+                             if iso < orphan else [("disk", orphan), ("dvd", iso)])
+
+    def test_a_symlinked_duplicate_is_not_an_orphan(self):
+        # Comparing real paths keeps a symlinked VM folder from reporting every
+        # disk in it a second time.
+        with tempfile.TemporaryDirectory() as d:
+            real = os.path.join(d, "real.vdi")
+            with open(real, "w") as f:
+                f.write("x")
+            os.symlink(real, os.path.join(d, "link.vdi"))
+            self.assertEqual(scan_for_images([d], [real]), [])
+
+    def test_subfolders_can_be_skipped(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "sub"))
+            with open(os.path.join(d, "sub", "deep.vdi"), "w") as f:
+                f.write("x")
+            self.assertEqual(scan_for_images([d], [], recursive=False), [])
+            self.assertEqual(len(scan_for_images([d], [], recursive=True)), 1)
+
+    def test_a_missing_folder_is_skipped_quietly(self):
+        self.assertEqual(scan_for_images(["/nonexistent-folder"], []), [])
+
+
+class HealthTest(unittest.TestCase):
+    def test_a_clean_registry_reports_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "snap.vdi")
+            with open(path, "w") as f:
+                f.write("x")
+            records = parse_media_list(SNAPSHOT_LISTING)
+            records[0].location = path
+            self.assertEqual(health_findings({"disk": records}), [])
+        self.assertEqual(health_report([]), "No problems found.\n")
+
+    def test_an_inaccessible_medium_is_an_error(self):
+        records = parse_media_list(HDDS_LONG)
+        for rec in records:
+            rec.state = "inaccessible"
+            rec.access_error = "VERR_FILE_NOT_FOUND opening image file"
+        findings = health_findings({"disk": records})
+        self.assertTrue(findings)
+        self.assertTrue(all(f.level == "error" for f in findings))
+        self.assertIn("VERR_FILE_NOT_FOUND", health_report(findings))
+
+    def test_a_missing_file_is_caught_before_virtualbox_notices(self):
+        # VBoxSVC caches State and only re-checks when something opens the
+        # medium, so a registered-but-deleted image still says "created".
+        records = parse_media_list(SNAPSHOT_LISTING)
+        findings = health_findings({"disk": records})
+        self.assertEqual([f.problem for f in findings],
+                         ["the backing file is missing"])
+
+    def test_an_unregistered_parent_is_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "child.vdi")
+            with open(path, "w") as f:
+                f.write("x")
+            records = parse_media_list(SNAPSHOT_LISTING)
+            records[0].location = path
+            records[0].parent_uuid = "44444444-4444-4444-4444-444444444444"
+            problems = [f.problem for f in health_findings({"disk": records})]
+            self.assertIn("its parent image is not registered", problems)
+
+    def test_findings_carry_the_kind_so_they_can_be_revealed(self):
+        records = parse_media_list(SNAPSHOT_LISTING)
+        finding = health_findings({"dvd": records})[0]
+        self.assertEqual(finding.kind, "dvd")
+        self.assertEqual(finding.uuid, records[0].uuid)
+
+
+class ReclaimTest(unittest.TestCase):
+    def test_reclaimed_space_is_reported_as_measured(self):
+        line = reclaim_line("a.vdi", 2048, 1024)
+        self.assertIn("reclaimed 1.0 GB", line)
+        self.assertIn("2.0 GB", line)
+
+    def test_no_change_says_so_rather_than_claiming_zero_reclaimed(self):
+        self.assertIn("nothing to reclaim", reclaim_line("a.vdi", 512, 512))
+
+    def test_growth_is_not_reported_as_a_negative_reclaim(self):
+        self.assertIn("grew by", reclaim_line("a.vdi", 512, 600))
+
+    def test_an_unknown_size_reports_nothing(self):
+        self.assertEqual(reclaim_line("a.vdi", None, 100), "")
+        self.assertEqual(reclaim_line("a.vdi", 100, None), "")
 
 
 if __name__ == "__main__":

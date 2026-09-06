@@ -16,7 +16,10 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
 
 - **Media tabs** — hard disks, DVD images and floppy images
   (`VBoxManage list -l hdds|dvds|floppies`), each with format, capacity,
-  size on disk, type, state, attached VMs, location and UUID.
+  size on disk, type, state, attached VMs, the snapshot an attachment belongs
+  to, location and UUID.
+- **Multi-selection** — select several media and Compact, Remove, Detach or
+  Convert them in one queued run that stops at the first failure.
 - **Diff-chain tree** — differencing images are nested under their parent
   (snapshot chains at a glance).
 - **Table polish** — sortable columns (sizes sort numerically),
@@ -34,22 +37,59 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
   optional `--mtype`, `--discard` (guest TRIM, which is what makes compaction
   pay off), `--nonrotational` and `--hotpluggable`; the
   attach dialog reads the VM's controllers via
-  `showvminfo --machinereadable`, pre-selects the first free port, and marks
-  running VMs. Detach locates the right controller/port automatically.
+  `showvminfo --machinereadable`, pre-selects the first free port, derives the
+  device number from the controller type (only IDE and floppy controllers have
+  a device 1) and marks running VMs. DVD and floppy attachments can also point
+  at an empty drive, the Guest Additions ISO or a **host drive**, with
+  `--passthrough`, `--tempeject` and `--forceunmount`. Detach locates the right
+  controller/port automatically, for one medium or for a whole selection.
 - **In-use guard** — media attached to a VM show the VM names in the list;
   removing them is blocked until they are detached.
-- **Compact** — reclaim unused space (`modifymedium --compact`), single disk
-  or **all VDIs in one queued batch**.
-- **Resize** — grow a disk (`modifymedium --resize`, MB).
-- **Convert / Clone** — clone to a different format (`clonemedium --format`).
+- **Compact** — reclaim unused space (`modifymedium --compact`), single disk,
+  a selection, or **all VDIs in one queued batch**. Reports what it actually
+  gave back, measured across the refresh that follows.
+- **Resize** — grow a disk (`modifymedium --resize`) in MB or GB, with the
+  current → new delta shown as you type, or to an exact byte count
+  (`--resizebyte`, which also takes hex and K/M/G). Shrinking is refused with
+  an explanation rather than a VirtualBox error.
+- **Convert / Clone** — clone to a different format *and* variant
+  (`clonemedium --format --variant`), into a new file or into a pre-created
+  one (`--existing`). A selection of disks can be converted into one folder in
+  a single queued run, with the target names previewed first.
+- **Free-space preflight** — create, resize and clone show the target
+  filesystem's free space against what the operation will take, and confirm
+  before starting one that does not fit. VBoxManage does not reserve space up
+  front, so an image that will not fit fails part-way and leaves a partial
+  file behind.
 - **Import RAW** — convert a raw `.img/.raw/.bin` into a managed format
   (`convertfromraw`); the result lands in the media library automatically.
+- **Media health** — everything wrong with the registry that can be seen
+  without running a command: media VirtualBox cannot open, backing files that
+  have gone missing while the registry still says they are fine, differencing
+  images whose parent is not registered, encrypted media with no password ID.
+  Double-click a finding to jump to the medium, or run a read-only
+  `internalcommands repairhd -dry-run` pass over the VDIs.
+- **Scan for unregistered images** — walk chosen folders for
+  `.vdi/.vmdk/.vhd/.iso/.img` files that neither VirtualBox nor the library
+  knows about, and add the ones you pick.
+- **Export** — write the current tab to CSV or JSON (*File → Export listing…*,
+  `Ctrl+E`), or copy selected rows as TSV. Sizes are exported as plain
+  megabyte numbers as well as formatted cells, so they can be summed
+  elsewhere.
+- **Drag and drop** — drop image files on the window to add them to the
+  library; a dropped raw image offers Import RAW instead.
 - **Properties** — change medium type
   (normal/writethrough/immutable/shareable/readonly/multiattach), the
   immutable auto-reset flag and the description
   (`modifymedium --type/--autoreset/--description`). A differencing image's
   type cannot be changed, and the dialog says so rather than letting
   VirtualBox refuse it.
+- **Format properties** — view and edit a medium's format-specific properties
+  (`mediumproperty get|set|delete`). The values come from the listing that is
+  already on screen and the names from the format's own schema in
+  `list hddbackends`, so opening the dialog runs nothing. Some properties are
+  only read when the image is created (VDI's `AllocationBlockSize` among
+  them): VirtualBox accepts the change and keeps the old value.
 - **Move** — relocate a disk file on disk (`modifymedium --move`).
 - **Password check** — verify a medium's current password without changing
   anything (`checkmediumpwd`).
@@ -84,7 +124,10 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
   which VirtualBox treats as read-only.
 - **Command history** — every command run, with its exit code, in
   *File → Command history…*; copy one, all, or the current command line
-  straight from the output panel.
+  straight from the output panel, or **re-run** one. A command whose password
+  went over stdin or through a temp file that has since been shredded is
+  refused rather than replayed into a hang; a destructive one needs the word
+  RUN typed.
 - **Progress bar** — long operations (clone, compact, create) report live
   percentage parsed from VBoxManage's `0%...10%...` stream.
 - **Context menu** — copy UUID / location, open the containing folder, and
@@ -226,5 +269,7 @@ build/                PyInstaller workdir (gitignored)
   confirmation.
 - Type changes and detach require the medium not to be in use by a running
   VM; VBoxManage's error is shown verbatim if it refuses.
-- Encryption needs the VirtualBox **Extension Pack**; changing an existing
-  password in one step is not supported (decrypt, then encrypt again).
+- Encryption needs the VirtualBox **Extension Pack**.
+- `repairhd -dry-run` writes nothing, but on 7.2.12 it signs off with
+  "Corrupted VDI image repaired successfully" whatever it found — the line
+  above that one is the verdict. The health dialog says so before running it.

@@ -1,5 +1,7 @@
 """MainWindow integration tests against a fake VBoxManage executable."""
 
+import csv
+import json
 import os
 import stat
 import sys
@@ -16,6 +18,10 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from vboxfront import (
     COLUMNS,
+    COL_SNAPSHOT,
+    OrphanScanDialog,
+    RemoveDialog,
+    add_library_path,
     COL_CAPACITY,
     COL_NAME,
     COL_STATE,
@@ -98,7 +104,13 @@ def wait_until(cond, timeout=10.0) -> bool:
     return False
 
 
-class MainWindowTest(unittest.TestCase):
+class FakeVBoxManageTest(unittest.TestCase):
+    """Fixture only: a fake VBoxManage on PATH and a window driven against it.
+
+    Split out from the tests that use it so a second suite can inherit the
+    fixture without inheriting — and re-running — every test in it.
+    """
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication(sys.argv[:1])
@@ -160,6 +172,8 @@ class MainWindowTest(unittest.TestCase):
             for i in range(pane.tree.topLevelItemCount())
         ]
 
+
+class MainWindowTest(FakeVBoxManageTest):
     def test_populates_tree_with_parent_chains(self):
         w = self.make_window()
         pane = w.panes["disk"]
@@ -401,8 +415,7 @@ class MainWindowTest(unittest.TestCase):
         dlg._ok()
         commands = [c for c in (dlg.args("disk"), dlg.autoreset_command()) if c]
         self.assertEqual(len(commands), 2, "type and autoreset are separate calls")
-        w._cmd_queue = [(c, None) for c in commands[1:]]
-        w.runner.run(commands[0])
+        w._run_queue([(c, None, None) for c in commands])
         self.assertTrue(
             wait_until(lambda: not w.runner.is_busy() and not w._cmd_queue
                        and not w._refreshing),
@@ -578,6 +591,337 @@ class MainWindowTest(unittest.TestCase):
         selected = pane.selected_record()
         self.assertIsNotNone(selected)
         self.assertEqual(selected.uuid, "cccccccc-3333-3333-3333-333333333333")
+
+
+class BatchOperationTest(FakeVBoxManageTest):
+    """Multi-selection: every batch action takes what is selected."""
+
+    def select(self, w, *uuids):
+        pane = w.panes["disk"]
+        pane.tree.clearSelection()
+        for uuid in uuids:
+            for item in pane._iter_items():
+                if item.data(COL_NAME, vboxfront.Qt.ItemDataRole.UserRole) == uuid:
+                    item.setSelected(True)
+        return pane
+
+    def test_the_tree_allows_more_than_one_row(self):
+        w = self.make_window()
+        pane = self.select(w, "aaaaaaaa-1111-1111-1111-111111111111",
+                           "cccccccc-3333-3333-3333-333333333333")
+        self.assertEqual(len(pane.selected_records()), 2)
+
+    def test_compact_queues_one_command_per_selected_disk(self):
+        w = self.make_window()
+        self.select(w, "aaaaaaaa-1111-1111-1111-111111111111",
+                    "bbbbbbbb-2222-2222-2222-222222222222")
+        with mock.patch.object(QMessageBox, "question",
+                               return_value=QMessageBox.StandardButton.Yes):
+            w.compact_selected()
+        self.assertTrue(
+            wait_until(lambda: not w.runner.is_busy() and not w._cmd_queue
+                       and not w._refreshing),
+            "compact queue did not drain",
+        )
+        with open(self.log) as f:
+            compacts = [l for l in f if "--compact" in l]
+        self.assertEqual(len(compacts), 2)
+        self.assertIn("aaaaaaaa-1111-1111-1111-111111111111", compacts[0])
+        self.assertIn("bbbbbbbb-2222-2222-2222-222222222222", compacts[1])
+
+    def test_compact_reports_what_it_actually_reclaimed(self):
+        # Measured across the refresh that follows, not predicted: `list -l`
+        # cannot see blocks freed inside the guest, which is what compacting
+        # gives back.
+        w = self.make_window()
+        self.select(w, "aaaaaaaa-1111-1111-1111-111111111111")
+        w.compact_selected()
+        self.assertTrue(
+            wait_until(lambda: not w.runner.is_busy() and not w._cmd_queue
+                       and not w._refreshing and not w._size_before),
+            "compact did not finish",
+        )
+        # The fake listing never changes, so the honest report is "nothing".
+        self.assertIn("nothing to reclaim", w.runner.output.toPlainText())
+
+    def test_a_failed_batch_drops_the_rest_of_the_queue(self):
+        w = self.make_window()
+        w._run_queue([
+            (["hang"], None, None),
+            (["modifymedium", "disk", "never", "--compact"], None, None),
+        ])
+        self.assertTrue(wait_until(lambda: w.runner.is_busy()))
+        w.runner.cancel()
+        self.assertTrue(wait_until(lambda: not w.runner.is_busy()))
+        self.assertEqual(w._cmd_queue, [], "the queue survived a failure")
+        with open(self.log) as f:
+            self.assertNotIn("never", f.read())
+
+    def test_a_follow_up_belongs_to_its_own_command(self):
+        # A batch remove prunes one library entry per medium; a single shared
+        # slot would fire against whichever command happened to finish.
+        w = self.make_window()
+        save_library("disk", ["/fake/base.vdi", "/fake/other.vmdk"])
+        done = []
+        w._run_queue([
+            (["modifymedium", "disk", "a", "--compact"], None, lambda: done.append("a")),
+            (["modifymedium", "disk", "b", "--compact"], None, lambda: done.append("b")),
+        ])
+        self.assertTrue(
+            wait_until(lambda: not w.runner.is_busy() and not w._cmd_queue
+                       and not w._refreshing),
+            "queue did not drain",
+        )
+        self.assertEqual(done, ["a", "b"])
+
+    def test_remove_skips_the_media_it_cannot_remove(self):
+        w = self.make_window()
+        # base.vdi is attached to a VM *and* has a child; other.vmdk is free.
+        self.select(w, "aaaaaaaa-1111-1111-1111-111111111111",
+                    "cccccccc-3333-3333-3333-333333333333")
+        with mock.patch.object(QMessageBox, "question",
+                               return_value=QMessageBox.StandardButton.Yes), \
+             mock.patch.object(RemoveDialog, "exec", return_value=1):
+            w.remove_selected()
+        self.assertTrue(
+            wait_until(lambda: not w.runner.is_busy() and not w._cmd_queue
+                       and not w._refreshing),
+            "remove queue did not drain",
+        )
+        with open(self.log) as f:
+            closes = [l for l in f if "closemedium" in l]
+        self.assertEqual(len(closes), 1, "a blocked medium was removed anyway")
+        self.assertIn("cccccccc-3333-3333-3333-333333333333", closes[0])
+
+    def test_remove_refuses_when_nothing_is_removable(self):
+        w = self.make_window()
+        self.select(w, "aaaaaaaa-1111-1111-1111-111111111111")
+        with mock.patch.object(QMessageBox, "warning") as warn:
+            w.remove_selected()
+        warn.assert_called_once()
+        with open(self.log) as f:
+            self.assertNotIn("closemedium", f.read())
+
+    def test_a_batch_remove_prunes_each_library_entry(self):
+        w = self.make_window()
+        save_library("disk", ["/fake/other.vmdk", "/fake/keep.vdi"])
+        self.select(w, "cccccccc-3333-3333-3333-333333333333")
+        with mock.patch.object(RemoveDialog, "exec", return_value=1):
+            w.remove_selected()
+        self.assertTrue(
+            wait_until(lambda: not w.runner.is_busy() and not w._cmd_queue
+                       and not w._refreshing),
+            "remove did not finish",
+        )
+        self.assertEqual(load_library("disk"), ["/fake/keep.vdi"])
+
+    def test_the_selection_survives_the_refresh_between_batch_steps(self):
+        w = self.make_window()
+        pane = self.select(w, "aaaaaaaa-1111-1111-1111-111111111111",
+                           "cccccccc-3333-3333-3333-333333333333")
+        w.refresh_media()
+        self.assertTrue(wait_until(lambda: not w._refreshing))
+        self.assertEqual(
+            sorted(r.uuid for r in pane.selected_records()),
+            ["aaaaaaaa-1111-1111-1111-111111111111",
+             "cccccccc-3333-3333-3333-333333333333"],
+        )
+
+
+class ListingExportTest(FakeVBoxManageTest):
+    def test_export_writes_every_row_of_the_tab(self):
+        w = self.make_window()
+        w.filter_edit.setText("base")  # a filter must not silently shrink the export
+        target = os.path.join(self.workdir, "out.csv")
+        with mock.patch("vboxfront.QFileDialog.getSaveFileName",
+                        return_value=(target, "CSV (*.csv)")):
+            w.export_listing()
+        with open(target, newline="") as f:
+            # Read it as CSV, not as lines: a quoted Access Error legitimately
+            # contains newlines, and counting them is counting the wrong thing.
+            rows = list(csv.reader(f))
+        self.assertEqual(len(rows), 1 + len(w.panes["disk"].records))
+        self.assertEqual(rows[0][0], "name")
+        self.assertIn("base.vdi", [r[0] for r in rows[1:]])
+
+    def test_json_export_is_chosen_by_extension(self):
+        w = self.make_window()
+        target = os.path.join(self.workdir, "out.json")
+        with mock.patch("vboxfront.QFileDialog.getSaveFileName",
+                        return_value=(target, "")):
+            w.export_listing()
+        with open(target) as f:
+            rows = json.load(f)
+        self.assertEqual(len(rows), len(w.panes["disk"].records))
+
+    def test_an_extensionless_name_gets_one(self):
+        w = self.make_window()
+        target = os.path.join(self.workdir, "listing")
+        with mock.patch("vboxfront.QFileDialog.getSaveFileName",
+                        return_value=(target, "JSON (*.json)")):
+            w.export_listing()
+        self.assertTrue(os.path.exists(target + ".json"))
+
+    def test_copy_rows_uses_the_selection_when_there_is_one(self):
+        w = self.make_window()
+        pane = w.panes["disk"]
+        pane.select_uuid("cccccccc-3333-3333-3333-333333333333")
+        for item in pane._iter_items():
+            item.setSelected(item.text(COL_NAME) == "other.vmdk")
+        w.copy_rows_selected()
+        text = QApplication.clipboard().text()
+        self.assertEqual(len(text.strip().splitlines()), 2, "header plus one row")
+        self.assertIn("other.vmdk", text)
+
+
+class DropTest(FakeVBoxManageTest):
+    def _event(self, paths):
+        """A drop event carrying these paths.
+
+        The QMimeData is kept on the test: QDropEvent does not take ownership,
+        and a collected one leaves the event pointing at freed memory.
+        """
+        from PyQt6.QtCore import QMimeData, QPointF, QUrl
+        from PyQt6.QtCore import Qt as QtCore_Qt
+        from PyQt6.QtGui import QDropEvent
+        self._mime = QMimeData()
+        self._mime.setUrls([QUrl.fromLocalFile(p) for p in paths])
+        return QDropEvent(QPointF(1, 1), QtCore_Qt.DropAction.CopyAction, self._mime,
+                          QtCore_Qt.MouseButton.LeftButton,
+                          QtCore_Qt.KeyboardModifier.NoModifier)
+
+    def _drop(self, w, paths):
+        w.dropEvent(self._event(paths))
+
+    def test_a_dropped_image_joins_the_library(self):
+        w = self.make_window()
+        path = os.path.join(self.workdir, "dropped.vdi")
+        with open(path, "w") as f:
+            f.write("x")
+        self._drop(w, [path])
+        self.assertIn(path, load_library("disk"))
+        self.assertTrue(wait_until(lambda: not w._refreshing))
+
+    def test_an_iso_lands_on_the_dvd_shelf(self):
+        w = self.make_window()
+        path = os.path.join(self.workdir, "boot.iso")
+        with open(path, "w") as f:
+            f.write("x")
+        self._drop(w, [path])
+        self.assertIn(path, load_library("dvd"))
+        self.assertEqual(load_library("disk"), [])
+
+    def test_a_dropped_raw_image_offers_the_importer(self):
+        # A .raw is not registerable; it has to go through convertfromraw.
+        w = self.make_window()
+        path = os.path.join(self.workdir, "sd.raw")
+        with open(path, "w") as f:
+            f.write("x")
+        with mock.patch.object(QMessageBox, "question",
+                               return_value=QMessageBox.StandardButton.Yes), \
+             mock.patch.object(MainWindow, "convert_from_raw") as importer:
+            self._drop(w, [path])
+        importer.assert_called_once_with(path)
+        self.assertEqual(load_library("disk"), [])
+
+    def test_anything_else_is_ignored(self):
+        w = self.make_window()
+        path = os.path.join(self.workdir, "notes.txt")
+        with open(path, "w") as f:
+            f.write("x")
+        self.assertEqual(w._dropped_paths(self._event([path])), [])
+
+
+class HealthAndScanTest(FakeVBoxManageTest):
+    @staticmethod
+    def _accepted_dialog(name: str, **attrs):
+        """Swap a dialog class for a stub that accepts with these answers.
+
+        Patching the class's own `exec` does not work: the attributes the
+        window reads are assigned per instance in __init__, so a patched class
+        attribute is shadowed — and `autospec` cannot bind `self` to a Qt slot.
+        """
+        class Stub:
+            def __init__(self, *args, **kwargs):
+                for key, value in attrs.items():
+                    setattr(self, key, value)
+
+            def exec(self):
+                return 1
+
+            def dry_run_caveat(self):
+                return "[health] stub"
+
+        return mock.patch(f"vboxfront.{name}", Stub)
+
+    def test_health_reveals_a_medium_in_its_own_tab(self):
+        w = self.make_window()
+        w.tabs.setCurrentIndex(KINDS.index("floppy"))
+        with self._accepted_dialog(
+            "HealthDialog",
+            reveal=("disk", "dddddddd-4444-4444-4444-444444444444"),
+            dry_run_paths=[],
+        ):
+            w.open_health()
+        self.assertEqual(w.current_kind(), "disk")
+        self.assertEqual(w.selected_medium().uuid,
+                         "dddddddd-4444-4444-4444-444444444444")
+
+    def test_the_dry_run_queues_one_read_only_check_per_vdi(self):
+        w = self.make_window()
+        paths = ["/fake/base.vdi", "/fake/child.vdi"]
+        with self._accepted_dialog("HealthDialog", reveal=None, dry_run_paths=paths):
+            w.open_health()
+        self.assertTrue(
+            wait_until(lambda: not w.runner.is_busy() and not w._cmd_queue
+                       and not w._refreshing),
+            "dry run queue did not drain",
+        )
+        with open(self.log) as f:
+            checks = [l for l in f if "repairhd" in l]
+        self.assertEqual(len(checks), 2)
+        self.assertTrue(all("-dry-run" in l for l in checks), "a check could write")
+
+    def test_the_orphan_scan_adds_what_was_chosen(self):
+        w = self.make_window()
+        found = [("disk", "/fake/found.vdi"), ("dvd", "/fake/found.iso")]
+        with self._accepted_dialog("OrphanScanDialog", chosen=found):
+            w.open_orphan_scan()
+        self.assertTrue(wait_until(lambda: not w._refreshing))
+        self.assertIn("/fake/found.vdi", load_library("disk"))
+        self.assertIn("/fake/found.iso", load_library("dvd"))
+
+    def test_the_scan_is_told_what_is_already_known(self):
+        w = self.make_window()
+        add_library_path("floppy", "/fake/boot.img")
+        captured = {}
+
+        def fake_init(dlg_self, known, parent=None):
+            captured["known"] = known
+            OrphanScanDialog.__mro__[1].__init__(dlg_self, parent)
+            dlg_self.chosen = []
+
+        with mock.patch.object(OrphanScanDialog, "__init__", fake_init), \
+             mock.patch.object(OrphanScanDialog, "exec", return_value=0):
+            w.open_orphan_scan()
+        self.assertIn("/fake/base.vdi", captured["known"], "registered media")
+        self.assertIn("/fake/boot.img", captured["known"], "library entries")
+
+
+class SnapshotColumnTest(FakeVBoxManageTest):
+    def test_the_snapshot_name_is_shown(self):
+        w = self.make_window()
+        pane = w.panes["disk"]
+        base = next(i for i in pane._iter_items() if i.text(COL_NAME) == "base.vdi")
+        # The fixture attaches base.vdi to a VM with no snapshot.
+        self.assertEqual(base.text(COL_SNAPSHOT), "")
+        rec = pane._by_uuid["aaaaaaaa-1111-1111-1111-111111111111"]
+        rec.in_use = ["vbf-smoke (UUID: 24aa0bbd-3d9c-4ba3-a41f-273c0ab57661) "
+                      "[Before update (UUID: 24aa0bbd-3d9c-4ba3-a41f-273c0ab57662)]"]
+        pane.populate(pane.records)
+        base = next(i for i in pane._iter_items() if i.text(COL_NAME) == "base.vdi")
+        self.assertEqual(base.text(COL_SNAPSHOT), "Before update")
+        self.assertEqual(base.text(COL_IN_USE), "vbf-smoke")
 
 
 if __name__ == "__main__":

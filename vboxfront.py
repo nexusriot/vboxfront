@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 import re
@@ -62,7 +64,7 @@ from PyQt6.QtWidgets import (
 # PyInstaller spec's bundle version and the Makefile/build-script fallback all
 # read it from here, so a bump only happens in one place. `git describe` still
 # wins when the checkout has tags.
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.7.0"
 
 DISK_FORMATS = ["VDI", "VMDK", "VHD", "RAW"]
 DISK_EXT = {"VDI": ".vdi", "VMDK": ".vmdk", "VHD": ".vhd", "RAW": ".img"}
@@ -137,9 +139,29 @@ MEDIUM_KEY_ORDER = {label: i for i, label in enumerate(MEDIUM_KEYS)}
 MEDIUM_KEY_ORDER["Format"] = MEDIUM_KEY_ORDER["Storage format"]
 
 COLUMNS = ["Name", "Format", "Capacity", "Size on disk", "Type", "State",
-           "Encryption", "In use by", "Location", "UUID"]
+           "Encryption", "In use by", "Snapshot", "Location", "UUID"]
 (COL_NAME, COL_FORMAT, COL_CAPACITY, COL_SIZE, COL_TYPE, COL_STATE,
- COL_ENCRYPTION, COL_IN_USE, COL_LOCATION, COL_UUID) = range(len(COLUMNS))
+ COL_ENCRYPTION, COL_IN_USE, COL_SNAPSHOT, COL_LOCATION, COL_UUID) = range(len(COLUMNS))
+
+#: Which tab an image file belongs on, by extension. `.img` is genuinely
+#: ambiguous (raw floppy or raw disk); floppy is the reading VirtualBox itself
+#: takes for a bare `.img`, and picking wrong only costs a failed re-open.
+MEDIA_EXTENSIONS = {
+    ".vdi": "disk", ".vmdk": "disk", ".vhd": "disk", ".vhdx": "disk",
+    ".hdd": "disk", ".qcow": "disk", ".qcow2": "disk", ".qed": "disk",
+    ".iso": "dvd", ".dmg": "dvd",
+    ".img": "floppy", ".ima": "floppy", ".flp": "floppy",
+}
+
+#: Raw images, which are not registerable media: they have to go through
+#: `convertfromraw` first. Kept apart from MEDIA_EXTENSIONS so a drop can tell
+#: "add this to the library" from "offer to import it".
+RAW_EXTENSIONS = {".raw", ".bin"}
+
+#: Controller types that address two devices per port (master/slave). Everything
+#: else VirtualBox exposes — SATA, SCSI, SAS, USB, NVMe, virtio — is one device
+#: per port, so offering device 1 there only produces a VBoxManage error.
+TWO_DEVICE_CONTROLLERS = {"PIIX3", "PIIX4", "ICH6", "I82078"}
 
 
 @dataclass
@@ -160,6 +182,7 @@ class MediumRecord:
     auto_reset: str = ""
     description: str = ""
     in_use: list[str] = field(default_factory=list)
+    properties: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -372,6 +395,14 @@ def parse_media_list(text: str) -> list[MediumRecord]:
         if not kv.get("UUID") or "Location" not in kv:
             continue
         in_use = [e for e in kv.get("In use by VMs", "").split("\n") if e]
+        # Several `Property:` lines in a row fold into one value (each repeat
+        # is the same field, so it continues rather than opens); the repeated
+        # label comes along on the continuation and is trimmed back off here.
+        properties = [
+            re.sub(r"^Property:\s*", "", line).strip()
+            for line in kv.get("Property", "").split("\n")
+            if line.strip()
+        ]
         records.append(
             MediumRecord(
                 uuid=kv.get("UUID", ""),
@@ -390,6 +421,7 @@ def parse_media_list(text: str) -> list[MediumRecord]:
                 auto_reset=kv.get("Auto-Reset", ""),
                 description=kv.get("Description", ""),
                 in_use=in_use,
+                properties=properties,
             )
         )
     return records
@@ -415,6 +447,62 @@ def parse_in_use_entry(entry: str) -> tuple[str, str] | None:
     """'name (UUID: xxx) [snap (UUID: yyy)]' -> (name, vm_uuid)."""
     m = re.match(r"(.+?) \(UUID: ([0-9a-fA-F-]{36})\)", entry.strip())
     return (m.group(1), m.group(2)) if m else None
+
+
+def parse_in_use_snapshot(entry: str) -> str:
+    """Snapshot name from 'vm (UUID: x) [snap name (UUID: y)]', or "".
+
+    The name is already in the listing, so nothing has to ask
+    `snapshot <vm> list` for it. A snapshot name can itself contain brackets
+    and parentheses, hence the anchored match on the trailing "(UUID: …)]".
+    """
+    m = re.search(r"\[(.+) \(UUID: [0-9a-fA-F-]{36}\)\]\s*$", entry.strip())
+    return m.group(1) if m else ""
+
+
+def snapshot_word(rec: MediumRecord) -> str:
+    """Snapshot names this medium is attached in, deduplicated, in order."""
+    names: list[str] = []
+    for entry in rec.in_use:
+        name = parse_in_use_snapshot(entry)
+        if name and name not in names:
+            names.append(name)
+    return ", ".join(names)
+
+
+def parse_host_drives(text: str) -> list[str]:
+    """Device names from `list hostdvds` / `list hostfloppies`.
+
+    Both print `UUID:`/`Name:` pairs; only the name is usable, because that is
+    what `storageattach --medium host:<name>` takes. Empty output (no optical
+    drive, or none visible to this user) is normal and yields an empty list.
+    """
+    names = []
+    for line in text.splitlines():
+        label, sep, value = line.partition(":")
+        if sep and label.strip() == "Name" and value.strip():
+            names.append(value.strip())
+    return names
+
+
+def controller_types(info: dict[str, str]) -> dict[str, str]:
+    """{controller name: type} from machinereadable VM info."""
+    types: dict[str, str] = {}
+    i = 0
+    while f"storagecontrollername{i}" in info:
+        types[info[f"storagecontrollername{i}"]] = info.get(f"storagecontrollertype{i}", "")
+        i += 1
+    return types
+
+
+def max_device_index(controller_type: str) -> int:
+    """Highest --device number a controller accepts.
+
+    IDE and floppy controllers address two devices per port; everything else
+    VirtualBox has is one, so a device spin that always went 0–1 offered a slot
+    that only VBoxManage's error could reject.
+    """
+    return 1 if (controller_type or "").upper() in TWO_DEVICE_CONTROLLERS else 0
 
 
 def parse_vms_list(text: str) -> list[tuple[str, str]]:
@@ -512,9 +600,15 @@ def create_disk_args(path: str, size_mb: int, fmt: str, variant: str) -> list[st
 
 def attach_args(vm: str, controller: str, port: int, device: int, kind: str, medium: str,
                 mtype: str = "", discard: bool = False, nonrotational: bool = False,
-                hotpluggable: bool = False) -> list[str]:
+                hotpluggable: bool = False, passthrough: bool = False,
+                tempeject: bool = False, forceunmount: bool = False) -> list[str]:
     """Every optional flag is omitted unless asked for, so the echoed command
-    stays the shortest one that does the job."""
+    stays the shortest one that does the job.
+
+    `medium` is passed through verbatim: besides a UUID or filename it can be
+    one of VBoxManage's own placeholders — `emptydrive`, `additions`, or
+    `host:<drive>` for a physical optical/floppy drive.
+    """
     args = [
         "storageattach", vm,
         "--storagectl", controller,
@@ -531,6 +625,40 @@ def attach_args(vm: str, controller: str, port: int, device: int, kind: str, med
         args += ["--nonrotational", "on"]
     if hotpluggable:
         args += ["--hotpluggable", "on"]
+    if passthrough:
+        args += ["--passthrough", "on"]
+    if tempeject:
+        args += ["--tempeject", "on"]
+    if forceunmount:
+        args.append("--forceunmount")
+    return args
+
+
+def clone_args(kind: str, source: str, target: str, fmt: str = "",
+               variant: str = "", existing: bool = False) -> list[str]:
+    """`clonemedium`, with the format/variant/--existing knobs the CLI takes.
+
+    `--existing` clones *into* a target that was created up front (keeping its
+    size and variant), which is the only way to clone into a pre-allocated
+    fixed image — everywhere else clonemedium refuses to touch a file that is
+    already there.
+    """
+    args = ["clonemedium", kind, source, target]
+    if existing:
+        args.append("--existing")
+    if fmt:
+        args += ["--format", fmt]
+    if variant and variant != "Standard":
+        args += ["--variant", variant]
+    return args
+
+
+def mediumproperty_args(kind: str, medium: str, op: str, name: str,
+                        value: str = "") -> list[str]:
+    """`mediumproperty <kind> get|set|delete <medium> <name> [<value>]`."""
+    args = ["mediumproperty", kind, op, medium, name]
+    if op == "set":
+        args.append(value)
     return args
 
 
@@ -551,6 +679,19 @@ def properties_args(kind: str, uuid: str, new_type: str | None, new_description:
     if new_description is not None:
         args += ["--description", new_description]
     return args if len(args) > 3 else None
+
+
+def resize_args(uuid: str, size_mb: int | None = None,
+                size_bytes: int | None = None) -> list[str]:
+    """Grow a disk. `--resizebyte` when an exact size was asked for.
+
+    `--resize` only speaks megabytes, so anything that is not a whole number of
+    them has to go through --resizebyte or be silently rounded.
+    """
+    args = ["modifymedium", "disk", uuid]
+    if size_bytes is not None:
+        return args + ["--resizebyte", str(size_bytes)]
+    return args + ["--resize", str(size_mb or 0)]
 
 
 def move_args(uuid: str, new_path: str) -> list[str]:
@@ -799,6 +940,303 @@ def totals_line(records: list[MediumRecord], shown: int | None = None) -> str:
         tail = f", {unknown} unknown" if unknown else ""
         parts.append(f"{format_mbytes(total_disk)} on disk{share}{tail}")
     return " · ".join(parts)
+
+
+def format_bytes(count: int | None) -> str:
+    """Human-readable byte count, for free-space figures that are not MBytes."""
+    if count is None:
+        return ""
+    value = float(count)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return ""
+
+
+def free_bytes_for(path: str) -> int | None:
+    """Free space on the filesystem that will hold `path`.
+
+    Walks up to the first directory that exists: the target file is normally
+    not there yet, and a path typed into a dialog may name folders that are not
+    either. None when nothing can be measured, which callers treat as "no
+    opinion" rather than as "full".
+    """
+    probe = os.path.dirname(os.path.abspath(path)) or os.sep
+    while probe and not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        return shutil.disk_usage(probe).free
+    except OSError:
+        return None
+
+
+def allocation_estimate(size_mb: int, variant: str = "") -> int:
+    """Bytes a create will actually consume up front.
+
+    A dynamic image writes little more than a header, so only a Fixed one has
+    to fit whole. The allowance on top is for metadata, not slack.
+    """
+    total = max(size_mb, 0) * 1024 * 1024
+    if "fixed" in (variant or "").lower():
+        return total + 2 * 1024 * 1024
+    return min(total, 8 * 1024 * 1024)
+
+
+def space_warning(path: str, needed: int) -> str:
+    """"" when `path`'s filesystem can hold `needed` bytes, else why not.
+
+    Checked before launching rather than after: VBoxManage does not reserve
+    space up front, so an image that does not fit fails somewhere in the middle
+    and leaves a partial file behind.
+    """
+    if needed <= 0:
+        return ""
+    free = free_bytes_for(path)
+    if free is None or needed <= free:
+        return ""
+    return (
+        f"{os.path.dirname(os.path.abspath(path)) or os.sep} has "
+        f"{format_bytes(free)} free, but this needs about "
+        f"{format_bytes(needed)}."
+    )
+
+
+#: Columns of an exported listing. Sizes go out as plain megabyte numbers on
+#: top of the formatted cells: the point of exporting is to add them up
+#: somewhere else, and "10.0 GB" does not sum.
+EXPORT_FIELDS = [
+    ("name", lambda r: os.path.basename(r.location) or r.uuid),
+    ("format", lambda r: r.fmt),
+    ("capacity_mb", lambda r: parse_capacity_mb(r.capacity)),
+    ("size_on_disk_mb", lambda r: parse_capacity_mb(r.size_on_disk)),
+    ("type", lambda r: medium_type_word(r.medium_type)),
+    ("state", lambda r: state_word(r)),
+    ("access_error", lambda r: r.access_error),
+    ("encryption", lambda r: encryption_word(r)),
+    ("password_id", lambda r: r.password_id),
+    ("in_use_by", lambda r: ", ".join(
+        e[0] for e in (parse_in_use_entry(x) for x in r.in_use) if e)),
+    ("snapshot", lambda r: snapshot_word(r)),
+    ("parent_uuid", lambda r: real_parent_uuid(r)),
+    ("location", lambda r: r.location),
+    ("uuid", lambda r: r.uuid),
+]
+
+
+def export_rows(records: list[MediumRecord]) -> list[dict]:
+    return [{name: fn(rec) for name, fn in EXPORT_FIELDS} for rec in records]
+
+
+def records_to_csv(records: list[MediumRecord]) -> str:
+    """CSV with a header row. `csv` rather than joins: a Description or a path
+    can contain the separator, and quoting it is not this file's job."""
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=[name for name, _fn in EXPORT_FIELDS],
+                            lineterminator="\n")
+    writer.writeheader()
+    for row in export_rows(records):
+        writer.writerow({k: "" if v is None else v for k, v in row.items()})
+    return buf.getvalue()
+
+
+def records_to_json(records: list[MediumRecord]) -> str:
+    return json.dumps(export_rows(records), indent=2) + "\n"
+
+
+def records_to_tsv(records: list[MediumRecord]) -> str:
+    """Tab-separated rows for pasting into a spreadsheet or a ticket.
+
+    No quoting layer, so anything containing a tab or newline is flattened —
+    the clipboard is a lossy target and a mangled cell is worse than a space.
+    """
+    lines = ["\t".join(name for name, _fn in EXPORT_FIELDS)]
+    for row in export_rows(records):
+        lines.append("\t".join(
+            "" if v is None else re.sub(r"[\t\r\n]+", " ", str(v))
+            for v in row.values()
+        ))
+    return "\n".join(lines) + "\n"
+
+
+def scan_for_images(folders: list[str], known: list[str],
+                    recursive: bool = True) -> list[tuple[str, str]]:
+    """(kind, path) for image files under `folders` that nothing knows about.
+
+    "Known" is the registry plus the app's own library, compared by real path
+    so a symlinked VM folder does not report every disk in it as an orphan.
+    Symlinked *directories* are not followed at all: a link back up the tree
+    would otherwise walk forever.
+    """
+    seen = set()
+    for path in known:
+        if path:
+            seen.add(os.path.realpath(path))
+    found: list[tuple[str, str]] = []
+    reported = set()
+    for folder in folders:
+        if not os.path.isdir(folder):
+            continue
+        for root, dirs, files in os.walk(folder):
+            if not recursive:
+                dirs[:] = []
+            for name in files:
+                kind = MEDIA_EXTENSIONS.get(os.path.splitext(name)[1].lower())
+                if not kind:
+                    continue
+                full = os.path.join(root, name)
+                real = os.path.realpath(full)
+                if real in seen or real in reported:
+                    continue
+                reported.add(real)
+                found.append((kind, full))
+    return sorted(found, key=lambda item: item[1])
+
+
+@dataclass
+class HealthFinding:
+    """One thing wrong with a medium, in a form a report can print."""
+
+    kind: str
+    uuid: str
+    location: str
+    level: str  # "error" or "warning"
+    problem: str
+    hint: str = ""
+
+    def line(self) -> str:
+        name = os.path.basename(self.location) or self.uuid
+        tail = f" — {self.hint}" if self.hint else ""
+        return f"[{self.level}] {name}: {self.problem}{tail}"
+
+
+def health_findings(media: dict[str, list[MediumRecord]]) -> list[HealthFinding]:
+    """Everything checkable about a registry without running a command.
+
+    Deliberately quiet about the merely unusual: only states that stop a medium
+    from being used, or that will surprise someone later, are reported, so an
+    empty result is a meaningful all-clear rather than a shrug.
+    """
+    findings: list[HealthFinding] = []
+    for kind, records in media.items():
+        by_uuid = {r.uuid: r for r in records}
+        for rec in records:
+            if is_inaccessible(rec):
+                findings.append(HealthFinding(
+                    kind, rec.uuid, rec.location, "error",
+                    "VirtualBox cannot open this medium",
+                    (rec.access_error.split("\n")[0] if rec.access_error
+                     else "use Resolve… to re-point or repair it"),
+                ))
+            elif rec.location and not os.path.exists(rec.location):
+                # Registered, not yet noticed as broken: VBoxSVC caches State
+                # and only re-checks when something opens the medium.
+                findings.append(HealthFinding(
+                    kind, rec.uuid, rec.location, "error",
+                    "the backing file is missing",
+                    "the registry still says it is fine; Resolve… can re-point it",
+                ))
+            parent = real_parent_uuid(rec)
+            if parent and parent not in by_uuid:
+                findings.append(HealthFinding(
+                    kind, rec.uuid, rec.location, "error",
+                    "its parent image is not registered",
+                    f"parent {parent}; Image UUID tools can reattach it",
+                ))
+            if (rec.encryption not in ("", "disabled") and not rec.password_id):
+                findings.append(HealthFinding(
+                    kind, rec.uuid, rec.location, "warning",
+                    "encrypted with no password ID recorded",
+                    "nothing names the key this image needs",
+                ))
+            capacity = parse_capacity_mb(rec.capacity)
+            on_disk = parse_capacity_mb(rec.size_on_disk)
+            if (capacity and on_disk is not None and on_disk == 0
+                    and not is_inaccessible(rec)):
+                findings.append(HealthFinding(
+                    kind, rec.uuid, rec.location, "warning",
+                    "nothing has been written to it",
+                    f"{format_mbytes(capacity)} provisioned, 0 allocated",
+                ))
+    return findings
+
+
+def health_report(findings: list[HealthFinding]) -> str:
+    if not findings:
+        return "No problems found.\n"
+    return "\n".join(f.line() for f in findings) + "\n"
+
+
+#: Command fragments that make a replay destructive. Kept as fragments rather
+#: than parsed verbs because history stores the printed command line, and every
+#: one of these is unambiguous in it.
+DESTRUCTIVE_FRAGMENTS = [
+    "--delete", "encryptmedium", "formatfat", "sethduuid", "sethdparentuuid",
+    "--resize", "--resizebyte", "--move", "--setlocation", "storageattach",
+]
+
+
+def is_destructive_command(command: str) -> bool:
+    """True when re-running this would change or destroy data.
+
+    `repairhd` counts unless it is the dry run, which only reports.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    if "repairhd" in tokens and "-dry-run" not in tokens:
+        return True
+    return any(fragment in tokens for fragment in DESTRUCTIVE_FRAGMENTS)
+
+
+def rerun_blocker(command: str) -> str:
+    """Why a history entry cannot be replayed as it stands, or "".
+
+    A password is never in the command line — it went over stdin, or through a
+    temp file that was shredded when the command exited — so replaying one of
+    those either hangs waiting for input or fails on a file that is gone. Both
+    are worse than refusing.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    if PASSWORD_STDIN in tokens or any(t.endswith(f"={PASSWORD_STDIN}") for t in tokens):
+        return ("the password for this command went over stdin and was never "
+                "stored; run it again from its own dialog")
+    if any("vboxfront-pw-" in t for t in tokens):
+        return ("this command read its passwords from temp files that were "
+                "shredded when it exited; run it again from the Encryption dialog")
+    return ""
+
+
+def rerun_args(command: str) -> list[str] | None:
+    """The argv to replay, with the leading VBoxManage path dropped."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    if os.path.basename(tokens[0]).lower().startswith("vboxmanage"):
+        tokens = tokens[1:]
+    return tokens or None
+
+
+def reclaim_line(name: str, before_mb: int | None, after_mb: int | None) -> str:
+    """What a compact actually gave back, measured rather than predicted."""
+    if before_mb is None or after_mb is None:
+        return ""
+    delta = before_mb - after_mb
+    if delta > 0:
+        return f"[compact] {name}: reclaimed {format_mbytes(delta)} ({format_mbytes(before_mb)} → {format_mbytes(after_mb)})"
+    if delta < 0:
+        return f"[compact] {name}: grew by {format_mbytes(-delta)}"
+    return f"[compact] {name}: nothing to reclaim ({format_mbytes(after_mb)} on disk)"
 
 
 class ElidingLabel(QLabel):
@@ -1094,7 +1532,10 @@ class MediaPane(QWidget):
         self.tree.setColumnCount(len(COLUMNS))
         self.tree.setHeaderLabels(COLUMNS)
         self.tree.setSelectionBehavior(self.tree.SelectionBehavior.SelectRows)
-        self.tree.setSelectionMode(self.tree.SelectionMode.SingleSelection)
+        # Extended, not single: every batch action (compact, remove, detach,
+        # convert) takes whatever is selected, and the sequential command queue
+        # already existed to run them one after another.
+        self.tree.setSelectionMode(self.tree.SelectionMode.ExtendedSelection)
         self.tree.setEditTriggers(self.tree.EditTrigger.NoEditTriggers)
         self.tree.setRootIsDecorated(kind == "disk")
         self.tree.setAllColumnsShowFocus(True)
@@ -1117,6 +1558,7 @@ class MediaPane(QWidget):
     def populate(self, records: list[MediumRecord]):
         selected = self.selected_record()
         prev_uuid = selected.uuid if selected else None
+        prev_selection = {r.uuid for r in self.selected_records()}
 
         self.records = records
         self._by_uuid = {r.uuid: r for r in records}
@@ -1157,6 +1599,12 @@ class MediaPane(QWidget):
 
         if prev_uuid:
             self.select_uuid(prev_uuid)
+        # A batch operation refreshes between its steps; losing the rest of the
+        # selection there would leave the user re-picking them every time.
+        if len(prev_selection) > 1:
+            for item in self._iter_items():
+                if item.data(COL_NAME, Qt.ItemDataRole.UserRole) in prev_selection:
+                    item.setSelected(True)
 
     def autosize_columns(self):
         """Fit the columns to their contents, once, on the first listing.
@@ -1190,6 +1638,7 @@ class MediaPane(QWidget):
             state_word(rec),
             encryption_word(rec),
             in_use_names,
+            snapshot_word(rec),
             rec.location,
             rec.uuid,
         ]
@@ -1208,6 +1657,7 @@ class MediaPane(QWidget):
             "\n".join(x for x in (rec.state, rec.access_error) if x),
             f"Password ID: {rec.password_id}" if rec.password_id else rec.encryption,
             "\n".join(rec.in_use),
+            "\n".join(rec.in_use),
             rec.location,
             rec.uuid,
         ]
@@ -1224,6 +1674,25 @@ class MediaPane(QWidget):
         if not item:
             return None
         return self._by_uuid.get(item.data(COL_NAME, Qt.ItemDataRole.UserRole) or "")
+
+    def selected_records(self) -> list[MediumRecord]:
+        """Every selected medium, in the order the tree shows them.
+
+        Rows carry all columns (SelectRows), so the selection contains one item
+        per selected *cell* column; keying on the UUID collapses that back to
+        one record per row.
+        """
+        found: list[MediumRecord] = []
+        seen: set[str] = set()
+        for item in self._iter_items():
+            if not item.isSelected():
+                continue
+            uuid = item.data(COL_NAME, Qt.ItemDataRole.UserRole) or ""
+            rec = self._by_uuid.get(uuid)
+            if rec and uuid not in seen:
+                seen.add(uuid)
+                found.append(rec)
+        return found
 
     def select_uuid(self, uuid: str):
         for item in self._iter_items():
@@ -1262,6 +1731,28 @@ class MediaPane(QWidget):
     def _update_totals(self):
         shown = sum(1 for item in self._iter_items() if not item.isHidden())
         self.totals.setText(totals_line(self.records, shown))
+
+
+def confirm_space(parent, path: str, needed: int) -> bool:
+    """Ask before starting something the target filesystem cannot hold.
+
+    A warning rather than a refusal: the estimate cannot know about
+    compression, reflinks or a quota that is about to be raised, and being
+    wrong should not stop the user.
+    """
+    warning = space_warning(path, needed)
+    if not warning:
+        return True
+    ret = QMessageBox.warning(
+        parent,
+        "Not enough space",
+        f"{warning}\n\nVBoxManage does not reserve space up front, so this "
+        "normally fails part-way and leaves a partial file behind.\n\n"
+        "Continue anyway?",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No,
+    )
+    return ret == QMessageBox.StandardButton.Yes
 
 
 class CreateDiskDialog(QDialog):
@@ -1310,6 +1801,12 @@ class CreateDiskDialog(QDialog):
         size_row.addWidget(self.spin, 1)
         size_row.addWidget(self.human)
         layout.addRow("Size:", size_row)
+
+        self.space = QLabel("")
+        self.space.setStyleSheet("color:#888;")
+        layout.addRow("", self.space)
+        self.path_edit.textChanged.connect(self._update_space)
+        self.variant_combo.currentTextChanged.connect(self._update_space)
         self._update_human(self.spin.value())
 
         buttons = QDialogButtonBox(
@@ -1321,6 +1818,27 @@ class CreateDiskDialog(QDialog):
 
     def _update_human(self, mb: int):
         self.human.setText(format_mbytes(mb))
+        self._update_space()
+
+    def _update_space(self, *_args):
+        """Free space on the target filesystem, next to what this will take.
+
+        A Fixed image writes its whole size immediately, so the two figures are
+        worth seeing together before the command runs rather than after it has
+        filled the disk.
+        """
+        path = self.path_edit.text().strip()
+        if not path:
+            self.space.setText("")
+            return
+        free = free_bytes_for(path)
+        needed = allocation_estimate(self.spin.value(), self.variant_combo.currentText())
+        if free is None:
+            self.space.setText("")
+            return
+        text = f"{format_bytes(free)} free, about {format_bytes(needed)} needed"
+        self.space.setText(text)
+        self.space.setStyleSheet("color:#c05000;" if needed > free else "color:#888;")
 
     def _variants_for(self, fmt: str) -> list[str]:
         backend = self._backends.get(fmt)
@@ -1373,6 +1891,11 @@ class CreateDiskDialog(QDialog):
                 "createmedium refuses to overwrite existing files; choose a new path.",
             )
             return
+        if not confirm_space(
+            self, path,
+            allocation_estimate(self.spin.value(), self.variant_combo.currentText()),
+        ):
+            return
         self.path = path
         self.size_mb = self.spin.value()
         self.fmt = self.fmt_combo.currentText()
@@ -1384,24 +1907,58 @@ class CreateDiskDialog(QDialog):
 
 
 class ResizeDialog(QDialog):
+    """Grow a disk, in MB or GB — or to an exact byte count.
+
+    Two ways in, because they answer different questions: a unit spin for "make
+    it 40 GB", and an exact size for "make it match that other image", which
+    has to go through --resizebyte since --resize only speaks whole megabytes.
+    """
+
     def __init__(self, disk: MediumRecord, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Resize disk")
         self.size_mb = 0
+        self.size_bytes: int | None = None
+        self._disk = disk
+        self._current_mb = parse_capacity_mb(disk.capacity)
 
         layout = QFormLayout(self)
         layout.addRow(QLabel(f"<b>{os.path.basename(disk.location)}</b>"))
-        layout.addRow("Current capacity:", QLabel(disk.capacity or "?"))
+        layout.addRow("Current capacity:", QLabel(
+            f"{format_mbytes(self._current_mb) or '?'}"
+            f"{f'  ({disk.capacity})' if disk.capacity else ''}"
+        ))
 
+        size_row = QHBoxLayout()
         self.spin = QSpinBox()
-        self.spin.setRange(1, 4 * 1024 * 1024)  # up to 4 TB
-        # VBoxManage --resize takes megabytes (MB), matching the "MBytes" that
-        # `list hdds` reports for capacity, so label it MB to avoid MiB/MB drift.
-        self.spin.setSuffix(" MB")
-        self.spin.setValue(parse_capacity_mb(disk.capacity) or 10240)
-        layout.addRow("New size:", self.spin)
+        self.spin.setRange(1, 4 * 1024 * 1024)  # 4 TB expressed in MB
+        self.spin.setValue(self._current_mb or 10240)
+        self.spin.valueChanged.connect(self._update_delta)
+        # VBoxManage --resize takes megabytes, matching the "MBytes" that
+        # `list hdds` reports, so MB is the base unit and GB is a multiplier on
+        # top of it — never a separate notion of size.
+        self.unit = QComboBox()
+        self.unit.addItem("MB", 1)
+        self.unit.addItem("GB", 1024)
+        self.unit.currentIndexChanged.connect(self._on_unit_changed)
+        size_row.addWidget(self.spin, 1)
+        size_row.addWidget(self.unit)
+        layout.addRow("New size:", size_row)
+
+        self.exact_check = QCheckBox("Exact size (--resizebyte)")
+        self.exact_check.toggled.connect(self._on_exact_toggled)
+        layout.addRow("", self.exact_check)
+        self.exact_edit = QLineEdit()
+        self.exact_edit.setPlaceholderText("e.g. 21474836480, 20G, 0x500000000")
+        self.exact_edit.setEnabled(False)
+        self.exact_edit.textChanged.connect(self._update_delta)
+        layout.addRow("Bytes:", self.exact_edit)
+
+        self.delta = QLabel("")
+        self.delta.setWordWrap(True)
+        layout.addRow("", self.delta)
         layout.addRow(
-            QLabel("<i>Note: VBoxManage can only grow disks, not shrink them.</i>")
+            QLabel("<i>VBoxManage can only grow disks, not shrink them.</i>")
         )
 
         buttons = QDialogButtonBox(
@@ -1411,10 +1968,95 @@ class ResizeDialog(QDialog):
         buttons.accepted.connect(self._ok)
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
+        self._update_delta()
+
+    def _on_unit_changed(self, *_args):
+        """Keep the size itself put when the unit changes.
+
+        Switching MB→GB on a 20480 in the box otherwise silently asks for
+        20480 GB, which the spin will happily accept.
+        """
+        # Read the value *before* narrowing the range: setRange clamps, so a
+        # 20480 MB box would already be 4096 by the time it was divided.
+        value = self.spin.value()
+        if self.unit.currentData() == 1024:
+            self.spin.setRange(1, 4 * 1024)
+            self.spin.setValue(max(1, round(value / 1024)))
+        else:
+            self.spin.setRange(1, 4 * 1024 * 1024)
+            self.spin.setValue(min(4 * 1024 * 1024, value * 1024))
+        self._update_delta()
+
+    def _on_exact_toggled(self, checked: bool):
+        self.exact_edit.setEnabled(checked)
+        self.spin.setEnabled(not checked)
+        self.unit.setEnabled(not checked)
+        self._update_delta()
+
+    def target_bytes(self) -> int | None:
+        if self.exact_check.isChecked():
+            return parse_byte_size(self.exact_edit.text())
+        return self.spin.value() * self.unit.currentData() * 1024 * 1024
+
+    def _update_delta(self, *_args):
+        target = self.target_bytes()
+        if target is None:
+            self.delta.setText("<span style='color:#c05000;'>Not a size.</span>")
+            return
+        current = (self._current_mb or 0) * 1024 * 1024
+        if not current:
+            self.delta.setText(f"New capacity {format_bytes(target)}.")
+            self.delta.setStyleSheet("color:#888;")
+            return
+        change = target - current
+        if change > 0:
+            self.delta.setText(
+                f"{format_bytes(current)} → {format_bytes(target)} "
+                f"(+{format_bytes(change)})"
+            )
+            self.delta.setStyleSheet("color:#888;")
+        elif change == 0:
+            self.delta.setText("Same size as now — nothing to do.")
+            self.delta.setStyleSheet("color:#c05000;")
+        else:
+            self.delta.setText(
+                f"Smaller than the current {format_bytes(current)}. VirtualBox "
+                "refuses to shrink an image; clone it into a smaller one instead."
+            )
+            self.delta.setStyleSheet("color:#c05000;")
 
     def _ok(self):
-        self.size_mb = self.spin.value()
+        target = self.target_bytes()
+        if target is None or target <= 0:
+            QMessageBox.warning(self, "Size", "Enter a size, e.g. 20G or 21474836480.")
+            return
+        current = (self._current_mb or 0) * 1024 * 1024
+        if current and target < current:
+            QMessageBox.warning(
+                self, "Cannot shrink",
+                f"{format_bytes(target)} is smaller than the current "
+                f"{format_bytes(current)}. VirtualBox only grows images "
+                "(VERR_NOT_SUPPORTED); clone this disk into a smaller one "
+                "instead.",
+            )
+            return
+        if current and target == current:
+            QMessageBox.information(
+                self, "No change", "That is the size it already is."
+            )
+            return
+        # Only the growth has to fit: the blocks that are already allocated are
+        # not written again.
+        if not confirm_space(self, self._disk.location, target - current):
+            return
+        if self.exact_check.isChecked() and target % (1024 * 1024):
+            self.size_bytes = target
+        else:
+            self.size_mb = target // (1024 * 1024)
         self.accept()
+
+    def args(self, uuid: str) -> list[str]:
+        return resize_args(uuid, size_mb=self.size_mb, size_bytes=self.size_bytes)
 
 
 class ConvertDialog(QDialog):
@@ -1423,7 +2065,9 @@ class ConvertDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Convert / Clone disk")
         self.target_format = "VDI"
+        self.target_variant = "Standard"
         self.target_path = ""
+        self.existing = False
         # The caller deletes an existing target (clonemedium refuses to
         # overwrite) — but only once the command is certain to run.
         self.overwrite = False
@@ -1443,7 +2087,14 @@ class ConvertDialog(QDialog):
                     self.fmt.setCurrentIndex(i)
                     break
         self.fmt.currentTextChanged.connect(self._update_default_path)
+        self.fmt.currentTextChanged.connect(self._on_format_changed)
         layout.addRow("Target format:", self.fmt)
+
+        # The variant is the target's, not the source's: cloning is the one
+        # place a dynamic image can be turned into a fixed one (or split).
+        self.variant = QComboBox()
+        self.variant.addItems(self._variants_for(self.fmt.currentText()))
+        layout.addRow("Target variant:", self.variant)
 
         path_row = QHBoxLayout()
         self.path_edit = QLineEdit()
@@ -1453,8 +2104,24 @@ class ConvertDialog(QDialog):
         path_row.addWidget(browse)
         layout.addRow("Target file:", path_row)
 
+        # --existing clones *into* a file that is already there, keeping its
+        # size and variant. It is the only way to clone into a pre-allocated
+        # image, and the only case where an existing target is not an error.
+        self.existing_check = QCheckBox(
+            "Clone into an existing image (--existing)"
+        )
+        self.existing_check.toggled.connect(self._on_existing_toggled)
+        layout.addRow("", self.existing_check)
+
+        self.space = QLabel("")
+        self.space.setStyleSheet("color:#888;")
+        layout.addRow("", self.space)
+
         self._src = disk
         self._update_default_path(self.fmt.currentText())
+        self.path_edit.textChanged.connect(self._update_space)
+        self.variant.currentTextChanged.connect(self._update_space)
+        self._update_space()
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -1469,6 +2136,51 @@ class ConvertDialog(QDialog):
         if backend:
             return backend.extension_for("HardDisk") or ".img"
         return DISK_EXT.get(fmt, ".img")
+
+    def _variants_for(self, fmt: str) -> list[str]:
+        backend = self._backends.get(fmt)
+        if backend:
+            return backend.variants()
+        return VMDK_VARIANTS if fmt == "VMDK" else DISK_VARIANTS
+
+    def _on_format_changed(self, fmt: str):
+        variants = self._variants_for(fmt)
+        current = self.variant.currentText()
+        self.variant.clear()
+        self.variant.addItems(variants)
+        if current in variants:
+            self.variant.setCurrentText(current)
+
+    def _on_existing_toggled(self, checked: bool):
+        # Both belong to the target file that already exists; VirtualBox reuses
+        # its geometry rather than being told a new one.
+        self.variant.setEnabled(not checked)
+        self.fmt.setEnabled(not checked)
+        self._update_space()
+
+    def _update_space(self, *_args):
+        path = self.path_edit.text().strip()
+        if not path or self.existing_check.isChecked():
+            self.space.setText("")
+            return
+        free = free_bytes_for(path)
+        if free is None:
+            self.space.setText("")
+            return
+        needed = self._needed_bytes()
+        self.space.setText(
+            f"{format_bytes(free)} free, about {format_bytes(needed)} needed"
+        )
+        self.space.setStyleSheet("color:#c05000;" if needed > free else "color:#888;")
+
+    def _needed_bytes(self) -> int:
+        """What the clone will occupy: its whole capacity when the target is
+        fixed, otherwise no more than the source has actually allocated."""
+        capacity = parse_capacity_mb(self._src.capacity) or 0
+        allocated = parse_capacity_mb(self._src.size_on_disk)
+        if "fixed" in self.variant.currentText().lower():
+            return allocation_estimate(capacity, "Fixed")
+        return (allocated if allocated is not None else capacity) * 1024 * 1024
 
     def _update_default_path(self, fmt: str):
         base, _ = os.path.splitext(self._src.location)
@@ -1497,30 +2209,63 @@ class ConvertDialog(QDialog):
             )
             return
         exists = os.path.exists(path)
-        if exists:
-            ret = QMessageBox.question(
-                self, "Overwrite?", f"{path} already exists. Overwrite?"
-            )
-            if ret != QMessageBox.StandardButton.Yes:
+        if self.existing_check.isChecked():
+            if not exists:
+                QMessageBox.warning(
+                    self, "No such image",
+                    "--existing clones into an image that is already there. "
+                    "Create the target first, or clear the checkbox.",
+                )
                 return
-        self.overwrite = exists
+            self.overwrite = False
+        else:
+            if exists:
+                ret = QMessageBox.question(
+                    self, "Overwrite?", f"{path} already exists. Overwrite?"
+                )
+                if ret != QMessageBox.StandardButton.Yes:
+                    return
+            if not confirm_space(self, path, self._needed_bytes()):
+                return
+            self.overwrite = exists
+        self.existing = self.existing_check.isChecked()
         self.target_format = self.fmt.currentText()
+        self.target_variant = self.variant.currentText()
         self.target_path = path
         self.accept()
+
+    def args(self, uuid: str) -> list[str]:
+        # Neither format nor variant is sent with --existing: the target image
+        # already has both, and VirtualBox keeps them.
+        if self.existing:
+            return clone_args("disk", uuid, self.target_path, existing=True)
+        return clone_args("disk", uuid, self.target_path,
+                          fmt=self.target_format, variant=self.target_variant)
 
 
 class RemoveDialog(QDialog):
     """Unregister a medium, optionally deleting the backing file."""
 
-    def __init__(self, medium: MediumRecord, parent=None):
+    def __init__(self, medium: MediumRecord | list[MediumRecord], parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Remove medium")
+        media = medium if isinstance(medium, list) else [medium]
+        self.setWindowTitle("Remove medium" if len(media) == 1 else "Remove media")
         self.delete_file = False
+        self._media = media
 
         layout = QFormLayout(self)
-        layout.addRow(QLabel(f"<b>{os.path.basename(medium.location)}</b>"))
-        layout.addRow("Location:", QLabel(medium.location or "?"))
-        layout.addRow("UUID:", QLabel(medium.uuid))
+        if len(media) == 1:
+            one = media[0]
+            layout.addRow(QLabel(f"<b>{os.path.basename(one.location)}</b>"))
+            layout.addRow("Location:", QLabel(one.location or "?"))
+            layout.addRow("UUID:", QLabel(one.uuid))
+        else:
+            layout.addRow(QLabel(f"<b>{len(media)} media</b>"))
+            listing = QListWidget()
+            listing.setMaximumHeight(140)
+            for rec in media:
+                listing.addItem(rec.location or rec.uuid)
+            layout.addRow("", listing)
 
         self.mode = QComboBox()
         # Safe default first: unregister but keep the file on disk.
@@ -1547,10 +2292,13 @@ class RemoveDialog(QDialog):
     def _ok(self):
         delete = self.mode.currentIndex() == 1
         if delete:
+            count = len(self._media)
             ret = QMessageBox.warning(
                 self,
                 "Delete file?",
-                "This will permanently delete the disk image file. Continue?",
+                (f"This will permanently delete {count} disk image files. Continue?"
+                 if count > 1 else
+                 "This will permanently delete the disk image file. Continue?"),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -2083,6 +2831,9 @@ class CommandHistoryDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Command history")
         self.resize(760, 420)
+        #: argv of a command the user asked to run again, minus the VBoxManage
+        #: path; None unless Re-run was confirmed.
+        self.rerun: list[str] | None = None
         layout = QVBoxLayout(self)
 
         self.list = QListWidget()
@@ -2100,7 +2851,13 @@ class CommandHistoryDialog(QDialog):
             self.list.addItem("No commands recorded yet.")
         layout.addWidget(self.list)
 
+        self.list.itemDoubleClicked.connect(lambda _item: self._rerun_selected())
+
         row = QHBoxLayout()
+        rerun = QPushButton("Re-run selected")
+        rerun.setToolTip("Run the selected command again, after confirmation")
+        rerun.clicked.connect(self._rerun_selected)
+        row.addWidget(rerun)
         copy_one = QPushButton("Copy selected")
         copy_one.clicked.connect(self._copy_selected)
         copy_all = QPushButton("Copy all")
@@ -2124,6 +2881,43 @@ class CommandHistoryDialog(QDialog):
         ]
         if commands:
             QApplication.clipboard().setText("\n".join(commands))
+
+    def _rerun_selected(self):
+        """Replay one recorded command, guarded twice over.
+
+        Re-run was left out of 1.2.0 because replaying `closemedium --delete`
+        from a list is far too easy to do by accident. It is safe to offer once
+        the two ways it goes wrong are closed off: a command whose secrets are
+        gone is refused outright, and a destructive one has to be confirmed by
+        typing, not by hitting Return on a default button.
+        """
+        item = self.list.currentItem()
+        command = item.data(Qt.ItemDataRole.UserRole) if item else ""
+        if not command:
+            QMessageBox.information(self, "Re-run", "Select a command first.")
+            return
+        blocker = rerun_blocker(command)
+        if blocker:
+            QMessageBox.warning(self, "Cannot re-run", f"{blocker}.\n\n{command}")
+            return
+        args = rerun_args(command)
+        if not args:
+            QMessageBox.warning(self, "Cannot re-run", f"Could not parse:\n\n{command}")
+            return
+        if is_destructive_command(command):
+            typed, ok = QInputDialog.getText(
+                self, "Re-run a destructive command",
+                "This command changes or destroys data:\n\n"
+                f"{command}\n\nType RUN to confirm.",
+            )
+            if not ok or typed.strip() != "RUN":
+                return
+        else:
+            ret = QMessageBox.question(self, "Re-run", f"Run this again?\n\n{command}")
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+        self.rerun = args
+        self.accept()
 
     def _copy_all(self):
         commands = [e.get("command", "") for e in load_history()]
@@ -2377,10 +3171,28 @@ class AttachDialog(QDialog):
         self._capture = capture
         self._vminfo: dict[str, str] = {}
         self._controllers: list[tuple[str, int]] = []
+        self._types: dict[str, str] = {}
         self._request = 0
 
         layout = QFormLayout(self)
         layout.addRow(QLabel(f"<b>{os.path.basename(medium.location)}</b>"))
+
+        # What actually goes into --medium. Usually this image, but the same
+        # command mounts an empty drive, the Guest Additions ISO or a physical
+        # drive, and there is nowhere else in the app to do that.
+        self.medium_combo = QComboBox()
+        self.medium_combo.addItem(
+            f"This image ({os.path.basename(medium.location) or medium.uuid})",
+            medium.uuid,
+        )
+        if kind in ("dvd", "floppy"):
+            self.medium_combo.addItem("Empty drive", "emptydrive")
+        if kind == "dvd":
+            self.medium_combo.addItem("Guest Additions ISO", "additions")
+        self.medium_combo.currentIndexChanged.connect(self._on_medium_changed)
+        if kind in ("dvd", "floppy"):
+            layout.addRow("Medium:", self.medium_combo)
+            self._load_host_drives()
 
         self.vm_combo = QComboBox()
         for name, uuid in vms:
@@ -2399,6 +3211,8 @@ class AttachDialog(QDialog):
         layout.addRow("Port:", self.port_spin)
 
         self.device_spin = QSpinBox()
+        # Narrowed per controller in _on_ctl_changed: only IDE and floppy
+        # controllers have a device 1.
         self.device_spin.setRange(0, 1)
         self.device_spin.valueChanged.connect(self._on_slot_changed)
         layout.addRow("Device:", self.device_spin)
@@ -2429,6 +3243,22 @@ class AttachDialog(QDialog):
             layout.addRow(self.nonrotational_check)
             layout.addRow(self.hotpluggable_check)
 
+        # Optical/removable flags. --passthrough hands the guest the real drive
+        # (needed for burning); --tempeject lets the guest eject without the
+        # change being saved; --forceunmount detaches a medium the guest has
+        # locked, which is the way out of "the medium is locked" on a running VM.
+        self.passthrough_check = QCheckBox("Pass the physical drive through (--passthrough)", self)
+        self.tempeject_check = QCheckBox("Guest may eject temporarily (--tempeject)", self)
+        self.forceunmount_check = QCheckBox("Force the current medium out (--forceunmount)", self)
+        for widget in (self.passthrough_check, self.tempeject_check, self.forceunmount_check):
+            widget.setVisible(kind in ("dvd", "floppy"))
+        if kind == "dvd":
+            layout.addRow(self.passthrough_check)
+            layout.addRow(self.tempeject_check)
+        if kind in ("dvd", "floppy"):
+            layout.addRow(self.forceunmount_check)
+        self._on_medium_changed()
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -2439,6 +3269,31 @@ class AttachDialog(QDialog):
 
         if vms:
             self._on_vm_changed(0)
+
+    def _load_host_drives(self):
+        """Offer the host's physical drives, when it has any this user can see.
+
+        `list hostdvds` comes back empty on a machine with no optical drive —
+        and on one where the user cannot enumerate them — so the entries are
+        added only if something is actually there.
+        """
+        subject = "hostdvds" if self._kind == "dvd" else "hostfloppies"
+
+        def done(code: int, output: str):
+            if code != 0:
+                return
+            for name in parse_host_drives(output):
+                self.medium_combo.addItem(f"Host drive: {name}", f"host:{name}")
+
+        self._capture(["list", subject], done)
+
+    def _on_medium_changed(self, *_args):
+        # Passthrough is a property of a real drive; VirtualBox rejects it for
+        # an image, and an empty drive has nothing to pass through.
+        real = str(self.medium_combo.currentData() or "").startswith("host:")
+        self.passthrough_check.setEnabled(real)
+        if not real:
+            self.passthrough_check.setChecked(False)
 
     def _on_vm_changed(self, _index):
         vm_uuid = self.vm_combo.currentData()
@@ -2461,6 +3316,7 @@ class AttachDialog(QDialog):
                 return
             self._vminfo = parse_machinereadable(output)
             self._controllers = vm_storage_controllers(self._vminfo)
+            self._types = controller_types(self._vminfo)
             for name, ports in self._controllers:
                 self.ctl_combo.addItem(f"{name} ({ports} ports)", name)
             self.status.setText("" if self._controllers else "This VM has no storage controllers.")
@@ -2473,6 +3329,9 @@ class AttachDialog(QDialog):
         name, ports = self._controllers[index]
         self.port_spin.setMaximum(max(ports - 1, 0))
         self.port_spin.setValue(find_free_port(self._vminfo, name, ports))
+        # SATA and friends only have device 0; offering 1 there produced a slot
+        # nothing but VBoxManage's error could reject.
+        self.device_spin.setMaximum(max_device_index(self._types.get(name, "")))
         self._on_slot_changed()
 
     def _on_slot_changed(self, *_args):
@@ -2516,17 +3375,22 @@ class AttachDialog(QDialog):
 
     def args(self) -> list[str]:
         disk = self._kind == "disk"
+        removable = self._kind in ("dvd", "floppy")
         return attach_args(
             self.vm_combo.currentData(),
             self.ctl_combo.currentData(),
             self.port_spin.value(),
             self.device_spin.value(),
             self._kind,
-            self._medium.uuid,
+            self.medium_combo.currentData() or self._medium.uuid,
             mtype=self.mtype_combo.currentData() if disk else "",
             discard=disk and self.discard_check.isChecked(),
             nonrotational=disk and self.nonrotational_check.isChecked(),
             hotpluggable=disk and self.hotpluggable_check.isChecked(),
+            passthrough=(removable and self.passthrough_check.isEnabled()
+                         and self.passthrough_check.isChecked()),
+            tempeject=removable and self.tempeject_check.isChecked(),
+            forceunmount=removable and self.forceunmount_check.isChecked(),
         )
 
 
@@ -2594,6 +3458,494 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
+class MediumPropertyDialog(QDialog):
+    """View and edit the format-specific properties of one medium.
+
+    The values come out of the listing that is already on screen (`list -l`
+    prints a `Property:` line per set property) and the *names* come from the
+    format's own schema in `list hddbackends`, so a property that exists but
+    has never been set still gets a field, with its default as the placeholder.
+    Nothing is read back with `mediumproperty get`: that would be one process
+    per property for data the refresh already carries.
+    """
+
+    def __init__(self, kind: str, medium: MediumRecord,
+                 backends: list[MediumBackend] | None = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Medium properties (format)")
+        self._kind = kind
+        self._medium = medium
+        self._original: dict[str, str] = {}
+        self._edits: dict[str, QLineEdit] = {}
+
+        for entry in medium.properties:
+            name, sep, value = entry.partition("=")
+            if sep:
+                self._original[name.strip()] = value.strip()
+
+        # `Storage format` comes back lower-cased ("vdi") while backend ids are
+        # upper-case, so the lookup has to normalise or it never matches.
+        self._schema = {}
+        for backend in backends or []:
+            if backend.id.upper() == medium.fmt.upper():
+                self._schema = {prop["name"]: prop for prop in backend.properties}
+                break
+
+        outer = QVBoxLayout(self)
+        outer.addWidget(QLabel(
+            f"<b>{os.path.basename(medium.location) or medium.uuid}</b> "
+            f"({medium.fmt or '?'})"
+        ))
+        self.form_host = QWidget()
+        self.form = QFormLayout(self.form_host)
+        outer.addWidget(self.form_host)
+
+        for name in sorted(set(self._original) | set(self._schema)):
+            self._add_row(name)
+        if not self._edits:
+            self.form.addRow(QLabel(
+                "<i>This format has no editable properties, and none are set.</i>"
+            ))
+
+        hint = QLabel(
+            "<i>Clearing a field deletes the property; leaving it empty when it "
+            "was never set does nothing. Properties are format-specific — "
+            "VirtualBox rejects a name the backend does not know. Some are only "
+            "read when the image is created (VDI's AllocationBlockSize among "
+            "them): the command succeeds and the value stays as it was.</i>"
+        )
+        hint.setWordWrap(True)
+        outer.addWidget(hint)
+
+        row = QHBoxLayout()
+        add = QPushButton("Add property…")
+        add.clicked.connect(self._add_custom)
+        row.addWidget(add)
+        row.addStretch(1)
+        outer.addLayout(row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        outer.addWidget(buttons)
+
+    def _add_row(self, name: str):
+        edit = QLineEdit(self._original.get(name, ""))
+        prop = self._schema.get(name, {})
+        if prop.get("default"):
+            edit.setPlaceholderText(f"default {prop['default']}")
+        label = f"{name} ({prop['type']}):" if prop.get("type") else f"{name}:"
+        self.form.addRow(label, edit)
+        self._edits[name] = edit
+
+    def _add_custom(self):
+        name, ok = QInputDialog.getText(self, "Add property", "Property name:")
+        name = name.strip()
+        if not ok or not name or name in self._edits:
+            return
+        self._add_row(name)
+
+    def commands(self) -> list[list[str]]:
+        """One mediumproperty call per changed field, in a stable order."""
+        commands = []
+        for name, edit in self._edits.items():
+            value = edit.text().strip()
+            before = self._original.get(name, "")
+            if value == before:
+                continue
+            if value:
+                commands.append(
+                    mediumproperty_args(self._kind, self._medium.uuid, "set", name, value)
+                )
+            elif before:
+                commands.append(
+                    mediumproperty_args(self._kind, self._medium.uuid, "delete", name)
+                )
+        return commands
+
+
+class BatchConvertDialog(QDialog):
+    """Clone several disks into one folder in a single queued run."""
+
+    def __init__(self, disks: list[MediumRecord],
+                 backends: list[MediumBackend] | None = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Convert selected disks")
+        self._disks = disks
+        self._backends = {b.id: b for b in disk_backends(backends or [])}
+        self.targets: list[tuple[MediumRecord, str]] = []
+        self.overwrite: list[str] = []
+
+        layout = QFormLayout(self)
+        layout.addRow(QLabel(f"<b>{len(disks)} disk(s) selected</b>"))
+
+        self.fmt = QComboBox()
+        self.fmt.addItems(list(self._backends) or [f for f in DISK_FORMATS if f != "RAW"])
+        self.fmt.currentTextChanged.connect(self._on_format_changed)
+        layout.addRow("Target format:", self.fmt)
+
+        self.variant = QComboBox()
+        self.variant.addItems(self._variants_for(self.fmt.currentText()))
+        layout.addRow("Target variant:", self.variant)
+
+        dir_row = QHBoxLayout()
+        self.dir_edit = QLineEdit(os.path.dirname(disks[0].location) if disks else "")
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse)
+        dir_row.addWidget(self.dir_edit, 1)
+        dir_row.addWidget(browse)
+        layout.addRow("Target folder:", dir_row)
+
+        self.suffix = QLineEdit("-converted")
+        layout.addRow("Name suffix:", self.suffix)
+
+        self.preview = QListWidget()
+        self.preview.setMaximumHeight(140)
+        layout.addRow("Will write:", self.preview)
+        for widget in (self.dir_edit, self.suffix):
+            widget.textChanged.connect(self._update_preview)
+        self.fmt.currentTextChanged.connect(self._update_preview)
+        self._update_preview()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Convert")
+        buttons.accepted.connect(self._ok)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def _variants_for(self, fmt: str) -> list[str]:
+        backend = self._backends.get(fmt)
+        if backend:
+            return backend.variants()
+        return VMDK_VARIANTS if fmt == "VMDK" else DISK_VARIANTS
+
+    def _on_format_changed(self, fmt: str):
+        variants = self._variants_for(fmt)
+        current = self.variant.currentText()
+        self.variant.clear()
+        self.variant.addItems(variants)
+        if current in variants:
+            self.variant.setCurrentText(current)
+
+    def _extension_for(self, fmt: str) -> str:
+        backend = self._backends.get(fmt)
+        if backend:
+            return backend.extension_for("HardDisk") or ".img"
+        return DISK_EXT.get(fmt, ".img")
+
+    def _browse(self):
+        path = QFileDialog.getExistingDirectory(self, "Target folder", self.dir_edit.text())
+        if path:
+            self.dir_edit.setText(path)
+
+    def _plan(self) -> list[tuple[MediumRecord, str]]:
+        folder = self.dir_edit.text().strip()
+        suffix = self.suffix.text()
+        ext = self._extension_for(self.fmt.currentText())
+        plan = []
+        for disk in self._disks:
+            base = os.path.splitext(os.path.basename(disk.location))[0] or disk.uuid
+            plan.append((disk, os.path.join(folder, base + suffix + ext)))
+        return plan
+
+    def _update_preview(self, *_args):
+        self.preview.clear()
+        for _disk, target in self._plan():
+            item = QListWidgetItem(target)
+            if os.path.exists(target):
+                item.setForeground(QColor(200, 120, 0))
+                item.setToolTip("Exists — will be deleted first")
+            self.preview.addItem(item)
+
+    def _ok(self):
+        folder = self.dir_edit.text().strip()
+        if not os.path.isdir(folder):
+            QMessageBox.warning(self, "No such folder", f"{folder} is not a folder.")
+            return
+        plan = self._plan()
+        targets = [t for _d, t in plan]
+        if len(set(targets)) != len(targets):
+            QMessageBox.warning(
+                self, "Name collision",
+                "Two sources would be written to the same target file. Give "
+                "them a different suffix or convert them separately.",
+            )
+            return
+        clashes = [t for d, t in plan if same_file(t, d.location)]
+        if clashes:
+            QMessageBox.warning(
+                self, "Same file",
+                f"{os.path.basename(clashes[0])} is one of the source disks. "
+                "Choose another folder or suffix.",
+            )
+            return
+        existing = [t for t in targets if os.path.exists(t)]
+        if existing:
+            ret = QMessageBox.question(
+                self, "Overwrite?",
+                f"{len(existing)} target file(s) already exist and will be "
+                "deleted before the clone that replaces them:\n\n"
+                + "\n".join(existing[:8])
+                + ("\n…" if len(existing) > 8 else ""),
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+        needed = 0
+        for disk, _target in plan:
+            capacity = parse_capacity_mb(disk.capacity) or 0
+            allocated = parse_capacity_mb(disk.size_on_disk)
+            if "fixed" in self.variant.currentText().lower():
+                needed += allocation_estimate(capacity, "Fixed")
+            else:
+                needed += (allocated if allocated is not None else capacity) * 1024 * 1024
+        if not confirm_space(self, os.path.join(folder, "x"), needed):
+            return
+        self.targets = plan
+        self.overwrite = existing
+        self.accept()
+
+    def commands(self) -> list[list[str]]:
+        variant = self.variant.currentText()
+        fmt = self.fmt.currentText()
+        return [
+            clone_args("disk", disk.uuid, target, fmt=fmt, variant=variant)
+            for disk, target in self.targets
+        ]
+
+
+class HealthDialog(QDialog):
+    """Everything wrong with the registry that can be seen without running a
+    command, plus an optional `repairhd` dry run over the VDIs."""
+
+    def __init__(self, media: dict[str, list[MediumRecord]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Media health")
+        self.resize(760, 420)
+        self.dry_run_paths: list[str] = []
+        self.reveal: tuple[str, str] | None = None
+        self._media = media
+        self._findings = health_findings(media)
+
+        layout = QVBoxLayout(self)
+        summary = QLabel(self._summary())
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        self.list = QListWidget()
+        for finding in self._findings:
+            item = QListWidgetItem(finding.line())
+            item.setData(Qt.ItemDataRole.UserRole, finding)
+            if finding.level == "error":
+                item.setForeground(QColor(220, 80, 80))
+            else:
+                item.setForeground(QColor(200, 120, 0))
+            item.setToolTip(finding.location)
+            self.list.addItem(item)
+        if not self._findings:
+            self.list.addItem("Nothing to report.")
+        self.list.itemDoubleClicked.connect(self._reveal_selected)
+        layout.addWidget(self.list)
+
+        row = QHBoxLayout()
+        reveal = QPushButton("Show in list")
+        reveal.clicked.connect(lambda: self._reveal_selected(self.list.currentItem()))
+        copy = QPushButton("Copy report")
+        copy.clicked.connect(self._copy)
+        self.dry_run = QPushButton("Check VDI images (dry run)")
+        self.dry_run.setToolTip(
+            "internalcommands repairhd -dry-run on every accessible VDI: reads "
+            "the image and reports damage without writing to it"
+        )
+        self.dry_run.clicked.connect(self._start_dry_run)
+        close = QPushButton("Close")
+        close.clicked.connect(self.reject)
+        row.addWidget(reveal)
+        row.addWidget(copy)
+        row.addWidget(self.dry_run)
+        row.addStretch(1)
+        row.addWidget(close)
+        layout.addLayout(row)
+
+    def _summary(self) -> str:
+        errors = sum(1 for f in self._findings if f.level == "error")
+        warnings = len(self._findings) - errors
+        total = sum(len(v) for v in self._media.values())
+        if not self._findings:
+            return f"Checked {total} medium(s): no problems found."
+        return (f"Checked {total} medium(s): <b>{errors} error(s)</b>, "
+                f"{warnings} warning(s).")
+
+    def _copy(self):
+        QApplication.clipboard().setText(health_report(self._findings))
+
+    def _reveal_selected(self, item):
+        finding = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if isinstance(finding, HealthFinding):
+            self.reveal = (finding.kind, finding.uuid)
+            self.accept()
+
+    def _start_dry_run(self):
+        """Queue a read-only repairhd over the VDIs whose file is actually there.
+
+        VDI only: repairhd understands VDI and VMDK, but `-format` has to be
+        told which, and a wrong guess is a confusing error rather than a check.
+        """
+        paths = [
+            rec.location for rec in self._media.get("disk", [])
+            if rec.fmt.upper() == "VDI" and rec.location and os.path.exists(rec.location)
+        ]
+        if not paths:
+            QMessageBox.information(
+                self, "Nothing to check",
+                "No VDI image with a readable file was found.",
+            )
+            return
+        ret = QMessageBox.question(
+            self, "Dry run",
+            f"Read and check {len(paths)} VDI image(s)? Nothing is written — "
+            "this is repairhd's dry run — but it reads every image in full, so "
+            "it can take a while.",
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        self.dry_run_paths = paths
+        self.accept()
+
+    @staticmethod
+    def dry_run_caveat() -> str:
+        """What the output panel is about to say, and why it is not alarming.
+
+        `repairhd -dry-run` on 7.2.12 prints "Corrupted VDI image repaired
+        successfully" as its closing line even when the line above it says the
+        image is consistent and nothing was written. Verified on a freshly
+        created VDI.
+        """
+        return ("[health] repairhd -dry-run writes nothing. It signs off with "
+                "\"Corrupted VDI image repaired successfully\" whatever it "
+                "found — the line above that one is the verdict.")
+
+
+class OrphanScanDialog(QDialog):
+    """Find image files on disk that neither VirtualBox nor the library knows."""
+
+    def __init__(self, known: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Scan for unregistered images")
+        self.resize(720, 460)
+        self._known = known
+        self.chosen: list[tuple[str, str]] = []
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Folders to search for <i>.vdi .vmdk .vhd .iso .img …</i> files "
+            "that are not registered with VirtualBox and not in the library:"
+        ))
+
+        self.folders = QListWidget()
+        self.folders.setMaximumHeight(90)
+        default = os.path.join(os.path.expanduser("~"), "VirtualBox VMs")
+        self.folders.addItem(default if os.path.isdir(default) else os.path.expanduser("~"))
+        layout.addWidget(self.folders)
+
+        folder_row = QHBoxLayout()
+        add = QPushButton("Add folder…")
+        add.clicked.connect(self._add_folder)
+        drop = QPushButton("Remove folder")
+        drop.clicked.connect(self._drop_folder)
+        self.recursive = QCheckBox("Include subfolders")
+        self.recursive.setChecked(True)
+        scan = QPushButton("Scan")
+        scan.clicked.connect(self._scan)
+        folder_row.addWidget(add)
+        folder_row.addWidget(drop)
+        folder_row.addWidget(self.recursive)
+        folder_row.addStretch(1)
+        folder_row.addWidget(scan)
+        layout.addLayout(folder_row)
+
+        self.results = QListWidget()
+        layout.addWidget(self.results)
+        self.status = QLabel("Not scanned yet.")
+        self.status.setStyleSheet("color:#888;")
+        layout.addWidget(self.status)
+
+        row = QHBoxLayout()
+        select_all = QPushButton("Select all")
+        select_all.clicked.connect(lambda: self._set_all(True))
+        select_none = QPushButton("Select none")
+        select_none.clicked.connect(lambda: self._set_all(False))
+        self.add_btn = QPushButton("Add checked to library")
+        self.add_btn.setEnabled(False)
+        self.add_btn.clicked.connect(self._ok)
+        close = QPushButton("Close")
+        close.clicked.connect(self.reject)
+        row.addWidget(select_all)
+        row.addWidget(select_none)
+        row.addStretch(1)
+        row.addWidget(self.add_btn)
+        row.addWidget(close)
+        layout.addLayout(row)
+
+    def _add_folder(self):
+        path = QFileDialog.getExistingDirectory(self, "Folder to scan")
+        if path and not self._folder_paths().count(path):
+            self.folders.addItem(path)
+
+    def _drop_folder(self):
+        for item in self.folders.selectedItems():
+            self.folders.takeItem(self.folders.row(item))
+
+    def _folder_paths(self) -> list[str]:
+        return [self.folders.item(i).text() for i in range(self.folders.count())]
+
+    def _set_all(self, checked: bool):
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for i in range(self.results.count()):
+            item = self.results.item(i)
+            if item.data(Qt.ItemDataRole.UserRole):
+                item.setCheckState(state)
+
+    def _scan(self):
+        folders = self._folder_paths()
+        if not folders:
+            QMessageBox.information(self, "No folders", "Add a folder to scan first.")
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            found = scan_for_images(folders, self._known, self.recursive.isChecked())
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.results.clear()
+        for kind, path in found:
+            item = QListWidgetItem(f"{KIND_META[kind]['title']}: {path}")
+            item.setData(Qt.ItemDataRole.UserRole, (kind, path))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            self.results.addItem(item)
+        self.add_btn.setEnabled(bool(found))
+        self.status.setText(
+            f"{len(found)} unregistered image(s) found in {len(folders)} folder(s)."
+            if found else
+            "No unregistered images found — everything here is already known."
+        )
+
+    def _ok(self):
+        self.chosen = [
+            self.results.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.results.count())
+            if self.results.item(i).checkState() == Qt.CheckState.Checked
+            and self.results.item(i).data(Qt.ItemDataRole.UserRole)
+        ]
+        if not self.chosen:
+            QMessageBox.information(self, "Nothing checked", "Check an image to add it.")
+            return
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2607,10 +3959,15 @@ class MainWindow(QMainWindow):
         self._pending_library_add: tuple[str, str] | None = None
         # (old, new) library path to rewrite after a successful --move.
         self._pending_library_move: tuple[str, str] | None = None
-        # Library entry to drop after a successful closemedium.
-        self._pending_library_remove: tuple[str, str] | None = None
-        # Commands queued behind the currently running one (batch operations).
-        self._cmd_queue: list[tuple[list[str], bytes | None]] = []
+        # Commands queued behind the currently running one (batch operations),
+        # each with its own follow-up to run when *that* command succeeds. A
+        # single shared pending-action slot cannot work for a batch: the
+        # follow-up would fire against whichever command happened to finish.
+        self._cmd_queue: list[tuple[list[str], bytes | None, object]] = []
+        self._followup = None
+        # uuid -> (name, size on disk before a compact), so the reclaimed space
+        # can be reported as measured rather than predicted.
+        self._size_before: dict[str, tuple[str, int | None]] = {}
         self._refreshing = False
         self._refresh_pending = False
         self._chain: list[tuple[list[str], object]] = []
@@ -2619,15 +3976,75 @@ class MainWindow(QMainWindow):
         self.backends: list[MediumBackend] = []
         self._backends_warned = False
 
+        self.setAcceptDrops(True)
         self._build_ui()
         self._refresh_check_vbm()
         self.refresh_media()
+
+    def dragEnterEvent(self, event):
+        if self._dropped_paths(event):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if self._dropped_paths(event):
+            event.acceptProposedAction()
+
+    def _dropped_paths(self, event) -> list[str]:
+        """Local image files in a drag, or [] when there is nothing to take."""
+        data = event.mimeData()
+        if not data.hasUrls():
+            return []
+        paths = []
+        for url in data.urls():
+            path = url.toLocalFile()
+            if not path or not os.path.isfile(path):
+                continue
+            ext = os.path.splitext(path)[1].lower()
+            if ext in MEDIA_EXTENSIONS or ext in RAW_EXTENSIONS:
+                paths.append(path)
+        return paths
+
+    def dropEvent(self, event):
+        """Dropped images join the library; a dropped raw image offers Import.
+
+        The library is the only way an unattached image stays visible (modern
+        VirtualBox forgets a standalone registration when VBoxSVC exits), so
+        adding is exactly what *Media → Add file…* does — this is the same
+        thing without the file dialog.
+        """
+        paths = self._dropped_paths(event)
+        if not paths:
+            return
+        event.acceptProposedAction()
+        raw = [p for p in paths if os.path.splitext(p)[1].lower() in RAW_EXTENSIONS
+               and os.path.splitext(p)[1].lower() not in MEDIA_EXTENSIONS]
+        images = [p for p in paths if p not in raw]
+        added = 0
+        for path in images:
+            kind = MEDIA_EXTENSIONS[os.path.splitext(path)[1].lower()]
+            add_library_path(kind, path)
+            self.runner.note(f"[library] added {kind} {path}")
+            added += 1
+        if added:
+            self.refresh_media()
+        if len(raw) == 1 and not added:
+            ret = QMessageBox.question(
+                self, "Import RAW",
+                f"{os.path.basename(raw[0])} is a raw image. Convert it into a "
+                "managed disk format?",
+            )
+            if ret == QMessageBox.StandardButton.Yes:
+                self.convert_from_raw(raw[0])
+        elif raw:
+            self.runner.note(
+                f"[drop] ignored {len(raw)} raw image(s); use Import RAW… for them"
+            )
 
     def _build_ui(self):
         self.act_refresh = self._action("Refresh", self.refresh_media, "F5")
         self.act_create = self._action("Create disk…", self.create_disk, "Ctrl+N")
         self.act_add = self._action("Add file…", self.add_media_from_file)
-        self.act_fromraw = self._action("Import RAW…", self.convert_from_raw)
+        self.act_fromraw = self._action("Import RAW…", lambda: self.convert_from_raw())
         self.act_info = self._action("Info", self.show_info_selected, "Ctrl+I")
         self.act_compact = self._action("Compact", self.compact_selected)
         self.act_compact_all = self._action("Compact all VDIs", self.compact_all_vdis)
@@ -2642,6 +4059,11 @@ class MainWindow(QMainWindow):
         self.act_create_floppy = self._action("Create floppy image…", self.create_floppy)
         self.act_contents = self._action("Contents…", self.show_contents_selected)
         self.act_formatfat = self._action("Format as FAT…", self.formatfat_selected)
+        self.act_medium_props = self._action("Format properties…", self.edit_medium_properties)
+        self.act_health = self._action("Media health…", self.open_health)
+        self.act_orphans = self._action("Scan for unregistered images…", self.open_orphan_scan)
+        self.act_export = self._action("Export listing…", self.export_listing, "Ctrl+E")
+        self.act_copy_rows = self._action("Copy rows (TSV)", self.copy_rows_selected)
         self.act_history = self._action("Command history…", self.open_history)
         self.act_attach = self._action("Attach to VM…", self.attach_selected)
         self.act_detach = self._action("Detach from VM…", self.detach_selected)
@@ -2653,6 +4075,7 @@ class MainWindow(QMainWindow):
         act_quit = self._action("Quit", self.close, "Ctrl+Q")
 
         menu_file = self.menuBar().addMenu("&File")
+        menu_file.addAction(self.act_export)
         menu_file.addAction(self.act_history)
         menu_file.addAction(self.act_settings)
         menu_file.addSeparator()
@@ -2668,9 +4091,12 @@ class MainWindow(QMainWindow):
         menu_media.addAction(self.act_fromraw)
         menu_media.addAction(self.act_compact_all)
         menu_media.addAction(self.act_uuid_tools)
+        menu_media.addAction(self.act_orphans)
+        menu_media.addAction(self.act_health)
         menu_media.addSeparator()
         for act in (self.act_info, self.act_contents, self.act_compact, self.act_resize,
-                    self.act_convert, self.act_props, self.act_move, self.act_encrypt,
+                    self.act_convert, self.act_props, self.act_medium_props,
+                    self.act_move, self.act_encrypt,
                     self.act_formatfat, self.act_resolve,
                     self.act_attach, self.act_detach):
             menu_media.addAction(act)
@@ -2795,7 +4221,7 @@ class MainWindow(QMainWindow):
     def _show_context_menu(self, pane: MediaPane, pos):
         menu = QMenu(self)
         for act in (self.act_info, self.act_contents, self.act_props,
-                    self.act_attach, self.act_detach):
+                    self.act_medium_props, self.act_attach, self.act_detach):
             menu.addAction(act)
         menu.addSeparator()
         for act in (self.act_compact, self.act_resize, self.act_convert,
@@ -2803,7 +4229,8 @@ class MainWindow(QMainWindow):
                     self.act_formatfat, self.act_resolve):
             menu.addAction(act)
         menu.addSeparator()
-        for act in (self.act_copy_uuid, self.act_copy_path, self.act_open_dir):
+        for act in (self.act_copy_uuid, self.act_copy_path, self.act_copy_rows,
+                    self.act_open_dir):
             menu.addAction(act)
         menu.addSeparator()
         menu.addAction(self.act_remove)
@@ -2834,6 +4261,19 @@ class MainWindow(QMainWindow):
             )
             return False
         return True
+
+    def selected_media(self) -> list[MediumRecord]:
+        return self.current_pane().selected_records()
+
+    def _require_selection_multi(self) -> list[MediumRecord]:
+        """Every selected medium, or the focused one when nothing is selected."""
+        media = self.selected_media()
+        if not media:
+            one = self.selected_medium()
+            media = [one] if one else []
+        if not media:
+            QMessageBox.information(self, "No selection", "Select a medium first.")
+        return media
 
     def _require_selection(self) -> MediumRecord | None:
         m = self.selected_medium()
@@ -2923,10 +4363,29 @@ class MainWindow(QMainWindow):
             f"{len(self.media[kind])} {KIND_META[kind]['list']}" for kind in KINDS
         )
         self.statusBar().showMessage(f"Registered media: {counts}.")
+        self._report_reclaimed()
         self._refreshing = False
         if self._refresh_pending:
             self._refresh_pending = False
             self.refresh_media()
+
+    def _report_reclaimed(self):
+        """Say what a compact actually gave back.
+
+        Measured after the fact rather than predicted before it: `list -l`
+        cannot see blocks that were allocated and then freed inside the guest,
+        which is exactly what compacting reclaims.
+        """
+        if not self._size_before:
+            return
+        by_uuid = {r.uuid: r for r in self.media["disk"]}
+        for uuid, (name, before) in self._size_before.items():
+            rec = by_uuid.get(uuid)
+            after = parse_capacity_mb(rec.size_on_disk) if rec else None
+            line = reclaim_line(name, before, after)
+            if line:
+                self.runner.note(line)
+        self._size_before = {}
 
     def create_disk(self):
         dlg = CreateDiskDialog(self.backends, self)
@@ -3032,21 +4491,29 @@ class MainWindow(QMainWindow):
         self.runner.run(["showmediuminfo", self.current_kind(), m.uuid])
 
     def compact_selected(self):
-        m = self._require_selection()
-        if not m:
+        disks = self._require_selection_multi()
+        if not disks:
             return
-        if m.fmt.upper() != "VDI":
+        others = [d for d in disks if d.fmt.upper() != "VDI"]
+        if others:
+            names = ", ".join(os.path.basename(d.location) or d.uuid for d in others[:5])
             ret = QMessageBox.question(
                 self,
                 "Compact",
-                f"Compacting is normally only supported for VDI; this disk is "
-                f"{m.fmt}. Try anyway?",
+                f"Compacting is normally only supported for VDI. "
+                f"{len(others)} of these are not ({names}"
+                f"{'…' if len(others) > 5 else ''}). Try anyway?",
             )
             if ret != QMessageBox.StandardButton.Yes:
                 return
-        if not self._require_idle():
-            return
-        self.runner.run(["modifymedium", "disk", m.uuid, "--compact"])
+        if len(disks) > 1:
+            ret = QMessageBox.question(
+                self, "Compact",
+                f"Compact {len(disks)} disk(s) one after another?",
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+        self._compact(disks)
 
     def compact_all_vdis(self):
         vdis = [r for r in self.media["disk"]
@@ -3058,13 +4525,25 @@ class MainWindow(QMainWindow):
             self, "Compact all",
             f"Compact {len(vdis)} VDI disk(s) one after another?",
         )
-        if ret != QMessageBox.StandardButton.Yes or not self._require_idle():
+        if ret != QMessageBox.StandardButton.Yes:
             return
-        commands = [(["modifymedium", "disk", r.uuid, "--compact"], None) for r in vdis]
-        first_args, first_stdin = commands[0]
-        self._cmd_queue = commands[1:]
-        self.runner.run(first_args, first_stdin)
-        self._show_queue_status()
+        self._compact(vdis)
+
+    def _compact(self, disks: list[MediumRecord]):
+        """Queue a compact per disk, remembering the sizes to compare after.
+
+        The whole queue runs before the refresh, so every reclaimed figure is
+        reported in one go rather than one refresh per disk.
+        """
+        if not self._run_queue(
+            [(["modifymedium", "disk", d.uuid, "--compact"], None, None) for d in disks]
+        ):
+            return
+        self._size_before = {
+            d.uuid: (os.path.basename(d.location) or d.uuid,
+                     parse_capacity_mb(d.size_on_disk))
+            for d in disks
+        }
 
     def resize_selected(self):
         m = self._require_selection()
@@ -3072,7 +4551,7 @@ class MainWindow(QMainWindow):
             return
         dlg = ResizeDialog(m, self)
         if dlg.exec() and self._require_idle():
-            self.runner.run(["modifymedium", "disk", m.uuid, "--resize", str(dlg.size_mb)])
+            self.runner.run(dlg.args(m.uuid))
 
     def _clear_target(self, path: str) -> bool:
         """Delete a confirmed overwrite target right before launching.
@@ -3091,35 +4570,42 @@ class MainWindow(QMainWindow):
         return True
 
     def convert_selected(self):
-        """Clone the selected disk to a different format (or same, defragmented)."""
-        m = self._require_selection()
-        if not m or not self._require_idle():
+        """Clone the selected disk(s) to another format, variant or file."""
+        disks = self._require_selection_multi()
+        if not disks or not self._require_idle():
             return
+        if len(disks) > 1:
+            self._convert_batch(disks)
+            return
+        m = disks[0]
         dlg = ConvertDialog(m, self.backends, self)
         if not dlg.exec() or not self._require_idle():
             return
         if dlg.overwrite and not self._clear_target(dlg.target_path):
             return
-        self.runner.run(
-            [
-                "clonemedium",
-                "disk",
-                m.uuid,
-                dlg.target_path,
-                "--format",
-                dlg.target_format,
-            ]
-        )
+        self.runner.run(dlg.args(m.uuid))
 
-    def convert_from_raw(self):
+    def _convert_batch(self, disks: list[MediumRecord]):
+        dlg = BatchConvertDialog(disks, self.backends, self)
+        if not dlg.exec() or not self._require_idle():
+            return
+        # Same rule as the single case: a confirmed overwrite target is deleted
+        # immediately before its clone, never while the dialog is still up.
+        for path in dlg.overwrite:
+            if not self._clear_target(path):
+                return
+        self._run_queue([(args, None, None) for args in dlg.commands()])
+
+    def convert_from_raw(self, src: str = ""):
         if not self._require_idle():
             return
-        src, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select RAW image",
-            os.path.expanduser("~"),
-            "RAW images (*.img *.raw *.bin);;All files (*)",
-        )
+        if not src:
+            src, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select RAW image",
+                os.path.expanduser("~"),
+                "RAW images (*.img *.raw *.bin);;All files (*)",
+            )
         if not src:
             return
         fmt, dst, overwrite = ask_target_format_and_path(self, src, default_fmt="VDI")
@@ -3143,11 +4629,7 @@ class MainWindow(QMainWindow):
         if not commands:
             self.statusBar().showMessage("Properties unchanged.")
             return
-        if not self._require_idle():
-            return
-        self._cmd_queue = [(c, None) for c in commands[1:]]
-        self.runner.run(commands[0])
-        self._show_queue_status()
+        self._run_queue([(c, None, None) for c in commands])
 
     def move_selected(self):
         m = self._require_selection()
@@ -3208,9 +4690,13 @@ class MainWindow(QMainWindow):
         self._capture(["list", "vms"], vms_done)
 
     def detach_selected(self):
-        m = self._require_selection()
-        if not m:
+        media = self._require_selection_multi()
+        if not media:
             return
+        if len(media) > 1:
+            self._detach_batch(media)
+            return
+        m = media[0]
         attachments = [e for e in (parse_in_use_entry(x) for x in m.in_use) if e]
         if not attachments:
             QMessageBox.information(self, "Detach", "This medium is not attached to any VM.")
@@ -3249,36 +4735,115 @@ class MainWindow(QMainWindow):
 
         self._capture(["showvminfo", vm_uuid, "--machinereadable"], vminfo_done)
 
+    def _detach_batch(self, media: list[MediumRecord]):
+        """Detach every attachment of every selected medium.
+
+        One `showvminfo` per VM rather than per attachment: the slot of each
+        medium is found in the same dump, and a VM holding six of them should
+        not be read six times.
+        """
+        pairs = []
+        for m in media:
+            for entry in m.in_use:
+                parsed = parse_in_use_entry(entry)
+                if parsed:
+                    pairs.append((m, parsed[0], parsed[1]))
+        if not pairs:
+            QMessageBox.information(
+                self, "Detach", "None of the selected media are attached to a VM."
+            )
+            return
+        listing = "\n".join(
+            f"{os.path.basename(m.location) or m.uuid} ← {vm}" for m, vm, _u in pairs[:12]
+        )
+        ret = QMessageBox.question(
+            self, "Detach",
+            f"Detach {len(pairs)} attachment(s)?\n\n{listing}"
+            + ("\n…" if len(pairs) > 12 else ""),
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+
+        def infos_ready(infos: dict[str, dict[str, str]]):
+            entries, missing = [], []
+            for m, vm_name, vm_uuid in pairs:
+                info = infos.get(vm_uuid)
+                slot = find_attachment(info, m.uuid) if info else None
+                if not slot:
+                    missing.append(f"{os.path.basename(m.location) or m.uuid} in {vm_name}")
+                    continue
+                ctl, port, device = slot
+                entries.append((detach_args(vm_uuid, ctl, port, device), None, None))
+            if missing:
+                self.runner.note(
+                    "[detach] could not locate: " + "; ".join(missing)
+                )
+            if not entries:
+                QMessageBox.warning(
+                    self, "Detach", "No attachment slot could be located."
+                )
+                return
+            self._run_queue(entries)
+
+        self._collect_vminfo(sorted({u for _m, _n, u in pairs}), infos_ready)
+
     def remove_selected(self):
-        m = self._require_selection()
-        if not m:
-            return
-        if m.in_use:
-            names = ", ".join(e[0] for e in (parse_in_use_entry(x) for x in m.in_use) if e)
-            QMessageBox.warning(
-                self, "In use",
-                f"This medium is attached to: {names}.\nDetach it before removing.",
-            )
-            return
-        children = child_names(self.media[self.current_kind()], m.uuid)
-        if children:
-            QMessageBox.warning(
-                self, "Has children",
-                f"{', '.join(children)} "
-                f"{'builds' if len(children) == 1 else 'build'} on this medium, "
-                "so closemedium refuses it (VBOX_E_OBJECT_IN_USE).\nRemove the "
-                f"differencing {'image' if len(children) == 1 else 'images'} first.",
-            )
-            return
-        dlg = RemoveDialog(m, self)
-        if not dlg.exec() or not self._require_idle():
+        media = self._require_selection_multi()
+        if not media:
             return
         kind = self.current_kind()
-        args = ["closemedium", kind, m.uuid]
-        if dlg.delete_file:
-            args.append("--delete")
-        self._pending_library_remove = (kind, m.location)
-        self.runner.run(args)
+        removable, blocked = [], []
+        for m in media:
+            if m.in_use:
+                names = ", ".join(
+                    e[0] for e in (parse_in_use_entry(x) for x in m.in_use) if e
+                )
+                blocked.append(
+                    f"{os.path.basename(m.location) or m.uuid}: attached to {names}"
+                )
+                continue
+            children = child_names(self.media[kind], m.uuid)
+            if children:
+                # closemedium answers VBOX_E_OBJECT_IN_USE for these; say which
+                # child holds it rather than passing the COM error along.
+                blocked.append(
+                    f"{os.path.basename(m.location) or m.uuid}: "
+                    f"{', '.join(children)} build{'s' if len(children) == 1 else ''} on it"
+                )
+                continue
+            removable.append(m)
+        if blocked and not removable:
+            QMessageBox.warning(
+                self, "Cannot remove",
+                "Nothing here can be removed yet:\n\n" + "\n".join(blocked),
+            )
+            return
+        if blocked:
+            ret = QMessageBox.question(
+                self, "Some cannot be removed",
+                f"{len(blocked)} of {len(media)} media cannot be removed:\n\n"
+                + "\n".join(blocked)
+                + f"\n\nRemove the other {len(removable)}?",
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+        dlg = RemoveDialog(removable, self)
+        if not dlg.exec():
+            return
+        entries = []
+        for m in removable:
+            args = ["closemedium", kind, m.uuid]
+            if dlg.delete_file:
+                args.append("--delete")
+            # Per-command, not a shared pending slot: in a batch the shared one
+            # would be claimed by whichever command finished.
+            entries.append((args, None, self._library_pruner(kind, m.location)))
+        self._run_queue(entries)
+
+    def _library_pruner(self, kind: str, location: str):
+        def prune():
+            remove_library_path(kind, location)
+        return prune
 
     def resolve_selected(self):
         m = self._require_selection()
@@ -3302,8 +4867,92 @@ class MainWindow(QMainWindow):
             return
         self.runner.run(dlg.command)
 
+    def edit_medium_properties(self):
+        m = self._require_selection()
+        if not m or not self._require_idle():
+            return
+        dlg = MediumPropertyDialog(self.current_kind(), m, self.backends, self)
+        if not dlg.exec():
+            return
+        commands = dlg.commands()
+        if not commands:
+            self.statusBar().showMessage("Properties unchanged.")
+            return
+        self._run_queue([(c, None, None) for c in commands])
+
+    def open_health(self):
+        dlg = HealthDialog(self.media, self)
+        if not dlg.exec():
+            return
+        if dlg.reveal:
+            kind, uuid = dlg.reveal
+            self.tabs.setCurrentIndex(KINDS.index(kind))
+            self.panes[kind].select_uuid(uuid)
+            return
+        if dlg.dry_run_paths:
+            # -dry-run reads and reports; it never writes, so a batch of them is
+            # safe to queue unattended.
+            self.runner.note(dlg.dry_run_caveat())
+            self._run_queue([
+                (repairhd_args(path, fmt="VDI", dry_run=True), None, None)
+                for path in dlg.dry_run_paths
+            ])
+
+    def open_orphan_scan(self):
+        known = [rec.location for records in self.media.values() for rec in records]
+        for kind in KINDS:
+            known += load_library(kind)
+        dlg = OrphanScanDialog(known, self)
+        if not dlg.exec() or not dlg.chosen:
+            return
+        for kind, path in dlg.chosen:
+            add_library_path(kind, path)
+            self.runner.note(f"[library] added {kind} {path}")
+        self.refresh_media()
+
+    def export_listing(self):
+        """Write the current tab's listing to CSV or JSON.
+
+        The whole tab, not the filter or the selection: an export that silently
+        dropped rows because a filter was set would be worse than no export.
+        """
+        kind = self.current_kind()
+        records = self.panes[kind].records
+        if not records:
+            QMessageBox.information(self, "Export", "This tab has no media to export.")
+            return
+        default = os.path.join(
+            os.path.expanduser("~"), f"vboxfront-{KIND_META[kind]['list']}.csv"
+        )
+        path, chosen = QFileDialog.getSaveFileName(
+            self, "Export listing", default, "CSV (*.csv);;JSON (*.json)"
+        )
+        if not path:
+            return
+        as_json = path.lower().endswith(".json") or "json" in (chosen or "").lower()
+        if not os.path.splitext(path)[1]:
+            path += ".json" if as_json else ".csv"
+        text = records_to_json(records) if as_json else records_to_csv(records)
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+        except OSError as e:
+            QMessageBox.critical(self, "Export failed", f"Could not write {path}: {e}")
+            return
+        self.runner.note(f"[export] {len(records)} row(s) → {path}")
+        self.statusBar().showMessage(f"Exported {len(records)} row(s) to {path}")
+
+    def copy_rows_selected(self):
+        records = self.selected_media() or self.panes[self.current_kind()].records
+        if not records:
+            return
+        QApplication.clipboard().setText(records_to_tsv(records))
+        self.statusBar().showMessage(f"Copied {len(records)} row(s) as TSV")
+
     def open_history(self):
-        CommandHistoryDialog(self).exec()
+        dlg = CommandHistoryDialog(self)
+        if dlg.exec() and dlg.rerun and self._require_idle():
+            self.runner.run(dlg.rerun)
 
     def copy_uuid_selected(self):
         m = self._require_selection()
@@ -3345,9 +4994,50 @@ class MainWindow(QMainWindow):
         self._save_ui_state()
         super().closeEvent(event)
 
+    def _run_queue(self, entries: list[tuple[list[str], bytes | None, object]]) -> bool:
+        """Run commands one after another, stopping at the first failure.
+
+        Each entry carries its own follow-up so a batch can do per-command
+        bookkeeping (dropping a library entry for the medium *that* command
+        removed, say) without a shared slot that the next command would claim.
+        """
+        if not entries or not self._require_idle():
+            return False
+        args, stdin_data, self._followup = entries[0]
+        self._cmd_queue = list(entries[1:])
+        self.runner.run(args, stdin_data)
+        self._show_queue_status()
+        return True
+
     def _show_queue_status(self):
         if self._cmd_queue:
             self.statusBar().showMessage(f"Queue: {len(self._cmd_queue)} command(s) pending.")
+
+    def _collect_vminfo(self, vm_uuids: list[str], done):
+        """Read `showvminfo` for several VMs in turn, then hand over the lot.
+
+        Sequential rather than parallel for the same reason the refresh chain
+        is: one VBoxSVC, and a burst of clients against it is how the service
+        gets wedged.
+        """
+        infos: dict[str, dict[str, str]] = {}
+        pending = list(vm_uuids)
+
+        def step():
+            if not pending:
+                done(infos)
+                return
+            uuid = pending.pop(0)
+
+            def got(code: int, output: str):
+                if code == 0:
+                    infos[uuid] = parse_machinereadable(output)
+                step()
+
+            if not self._capture(["showvminfo", uuid, "--machinereadable"], got):
+                done(infos)
+
+        step()
 
     def _on_runner_finished(self, code: int):
         # Only what CommandRunner ran, which is only ever a mutating command:
@@ -3359,7 +5049,10 @@ class MainWindow(QMainWindow):
                 code,
                 QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss"),
             )
+        followup, self._followup = self._followup, None
         if code == 0:
+            if followup:
+                followup()
             add, self._pending_library_add = self._pending_library_add, None
             if add and os.path.exists(add[1]):
                 add_library_path(add[0], add[1])
@@ -3371,19 +5064,15 @@ class MainWindow(QMainWindow):
                     if old in load_library(kind):
                         remove_library_path(kind, old)
                         add_library_path(kind, new)
-            remove, self._pending_library_remove = self._pending_library_remove, None
-            if remove:
-                remove_library_path(remove[0], remove[1])
         else:
             self._pending_library_add = None
             self._pending_library_move = None
-            self._pending_library_remove = None
             if self._cmd_queue:
                 self.runner.note(f"[queue] aborted, {len(self._cmd_queue)} command(s) dropped")
                 self._cmd_queue = []
 
         if self._cmd_queue:
-            args, stdin_data = self._cmd_queue.pop(0)
+            args, stdin_data, self._followup = self._cmd_queue.pop(0)
             self.runner.run(args, stdin_data)
             self._show_queue_status()
             return
