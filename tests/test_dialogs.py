@@ -2,6 +2,7 @@
 
 import os
 import pathlib
+import shutil
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,10 @@ from PyQt6.QtWidgets import QApplication, QMessageBox, QSizePolicy
 
 from tests.test_parsing import HDDBACKENDS
 from vboxfront import (
+    MIXED_TYPE,
+    TRASH_DIR_NAME,
+    free_slots,
+    parse_machinereadable,
     AttachDialog,
     BatchConvertDialog,
     CommandHistoryDialog,
@@ -205,6 +210,39 @@ class DialogTest(unittest.TestCase):
         ):
             dlg._ok()
         self.assertTrue(dlg.delete_file)
+
+    def test_the_confirmation_names_the_trash_the_file_will_go_to(self):
+        # The promise the second confirmation makes has to be checkable:
+        # "somewhere safe" is not.
+        get_settings().remove("trash/enabled")
+        get_settings().remove("trash/dir")
+        # A folder that really exists: the default trash is the image's own
+        # folder only while that folder can be written.
+        folder = tempfile.mkdtemp(prefix="vboxfront-dlg-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        dlg = RemoveDialog(record(location=os.path.join(folder, "test.vdi")))
+        dlg.mode.setCurrentIndex(1)
+        with mock.patch.object(
+            QMessageBox, "warning", return_value=QMessageBox.StandardButton.No
+        ) as warn:
+            dlg._ok()
+        text = warn.call_args[0][2]
+        self.assertIn(os.path.join(folder, TRASH_DIR_NAME), text)
+        self.assertIn("Undo delete", text)
+        self.assertNotIn("permanently", text)
+
+    def test_with_the_trash_off_the_confirmation_says_permanently(self):
+        get_settings().setValue("trash/enabled", False)
+        try:
+            dlg = RemoveDialog(record())
+            dlg.mode.setCurrentIndex(1)
+            with mock.patch.object(
+                QMessageBox, "warning", return_value=QMessageBox.StandardButton.No
+            ) as warn:
+                dlg._ok()
+            self.assertIn("permanently delete", warn.call_args[0][2])
+        finally:
+            get_settings().remove("trash/enabled")
 
     def test_properties_unchanged_yields_no_args(self):
         dlg = PropertiesDialog(record())
@@ -1202,6 +1240,285 @@ class AttachSlotsTest(unittest.TestCase):
         self.assertIn(record().uuid, args)
         for flag in ("--passthrough", "--tempeject", "--forceunmount"):
             self.assertNotIn(flag, args)
+
+
+class ConvertTargetIsARegisteredMediumTest(unittest.TestCase):
+    """Overwriting a clone target also deletes whatever is registered there.
+
+    clonemedium refuses a target that exists, so the app deletes it first —
+    which turns a plain "Overwrite?" yes into "delete the image VirtualBox has
+    registered at this path", leaving a registry entry pointing at a file that
+    is no longer the medium it names.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv[:1])
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="vboxfront-target-")
+        self.source = record(uuid="1" * 8, location=os.path.join(self.dir, "a.vdi"))
+        self.other = record(uuid="2" * 8, location=os.path.join(self.dir, "b.vdi"))
+        for rec in (self.source, self.other):
+            with open(rec.location, "w") as handle:
+                handle.write("x")
+
+    def test_the_overwrite_names_the_medium_it_would_destroy(self):
+        dlg = ConvertDialog(self.source, known=[self.source, self.other])
+        dlg.path_edit.setText(self.other.location)
+        with mock.patch.object(QMessageBox, "warning",
+                               return_value=QMessageBox.StandardButton.No) as warn:
+            dlg._ok()
+        warn.assert_called_once()
+        self.assertIn(self.other.uuid, warn.call_args[0][2])
+        self.assertEqual(dlg.target_path, "")
+
+    def test_saying_yes_still_goes_through(self):
+        dlg = ConvertDialog(self.source, known=[self.source, self.other])
+        dlg.path_edit.setText(self.other.location)
+        with mock.patch.object(QMessageBox, "warning",
+                               return_value=QMessageBox.StandardButton.Yes), \
+             mock.patch.object(QMessageBox, "question",
+                               return_value=QMessageBox.StandardButton.Yes):
+            dlg._ok()
+        self.assertEqual(dlg.target_path, self.other.location)
+        self.assertTrue(dlg.overwrite)
+
+    def test_an_unregistered_target_asks_only_the_plain_overwrite(self):
+        spare = os.path.join(self.dir, "spare.vdi")
+        with open(spare, "w") as handle:
+            handle.write("x")
+        dlg = ConvertDialog(self.source, known=[self.source, self.other])
+        dlg.path_edit.setText(spare)
+        with mock.patch.object(QMessageBox, "warning") as warn, \
+             mock.patch.object(QMessageBox, "question",
+                               return_value=QMessageBox.StandardButton.Yes):
+            dlg._ok()
+        warn.assert_not_called()
+        self.assertEqual(dlg.target_path, spare)
+
+
+class BatchConvertTargetCollisionTest(unittest.TestCase):
+    """The caller deletes every existing target before the queue starts.
+
+    So a plan that aims one disk's clone at another's backing file destroys
+    that disk before its own turn comes round — which is what re-running a
+    convert over a folder that already holds its output used to do.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv[:1])
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="vboxfront-batch-")
+        self.source = record(uuid="1" * 8, location=os.path.join(self.dir, "a.vdi"))
+        # Exactly what the default suffix would produce for the first disk.
+        self.previous = record(uuid="2" * 8,
+                               location=os.path.join(self.dir, "a-converted.vdi"))
+        for rec in (self.source, self.previous):
+            with open(rec.location, "w") as handle:
+                handle.write("x")
+
+    def test_a_target_that_is_another_selected_source_is_refused(self):
+        disks = [self.source, self.previous]
+        dlg = BatchConvertDialog(disks, parse_hddbackends(HDDBACKENDS), known=disks)
+        dlg.dir_edit.setText(self.dir)
+        dlg.fmt.setCurrentText("VDI")
+        with mock.patch.object(QMessageBox, "warning") as warn, \
+             mock.patch.object(QMessageBox, "question",
+                               return_value=QMessageBox.StandardButton.Yes):
+            dlg._ok()
+        warn.assert_called_once()
+        self.assertIn("source disk", warn.call_args[0][2])
+        self.assertEqual(dlg.targets, [])
+        self.assertEqual(dlg.overwrite, [])
+
+    def test_a_target_registered_elsewhere_is_named_before_it_goes(self):
+        # Only the first disk is being converted, so a-converted.vdi is not a
+        # source — but it is still a registered medium about to be deleted.
+        dlg = BatchConvertDialog([self.source], parse_hddbackends(HDDBACKENDS),
+                                 known=[self.source, self.previous])
+        dlg.dir_edit.setText(self.dir)
+        dlg.fmt.setCurrentText("VDI")
+        with mock.patch.object(QMessageBox, "warning",
+                               return_value=QMessageBox.StandardButton.No) as warn:
+            dlg._ok()
+        warn.assert_called_once()
+        self.assertIn(self.previous.uuid, warn.call_args[0][2])
+        self.assertEqual(dlg.overwrite, [])
+
+    def test_a_clean_folder_needs_no_warning_at_all(self):
+        spare = tempfile.mkdtemp(prefix="vboxfront-batch-out-")
+        dlg = BatchConvertDialog([self.source], parse_hddbackends(HDDBACKENDS),
+                                 known=[self.source, self.previous])
+        dlg.dir_edit.setText(spare)
+        dlg.fmt.setCurrentText("VDI")
+        with mock.patch.object(QMessageBox, "warning") as warn, \
+             mock.patch.object(QMessageBox, "question") as question:
+            dlg._ok()
+        warn.assert_not_called()
+        question.assert_not_called()
+        self.assertEqual(len(dlg.targets), 1)
+
+
+class FreeSlotsTest(unittest.TestCase):
+    """Filling a controller for a batch, stepping over what is taken."""
+
+    SATA = """\
+storagecontrollername0="SATA"
+storagecontrollertype0="IntelAhci"
+storagecontrollerportcount0="4"
+"SATA-0-0"="/x.vdi"
+"SATA-1-0"="none"
+"SATA-2-0"="/y.vdi"
+"SATA-3-0"="none"
+"""
+
+    def test_occupied_slots_are_stepped_over_never_replaced(self):
+        # storageattach replaces an occupied slot silently, which is the last
+        # thing a batch should do: nobody is watching each command.
+        info = parse_machinereadable(self.SATA)
+        self.assertEqual(free_slots(info, "SATA", 4, 0, 2), [(1, 0), (3, 0)])
+
+    def test_a_full_controller_yields_what_it_has(self):
+        info = parse_machinereadable(self.SATA)
+        self.assertEqual(free_slots(info, "SATA", 4, 0, 5), [(1, 0), (3, 0)])
+
+    def test_an_ide_controller_uses_both_devices_per_port(self):
+        info = parse_machinereadable(
+            'storagecontrollername0="IDE"\n'
+            'storagecontrollertype0="PIIX4"\n'
+            'storagecontrollerportcount0="2"\n'
+            '"IDE-0-0"="/x.vdi"\n'
+        )
+        self.assertEqual(free_slots(info, "IDE", 2, 1, 3),
+                         [(0, 1), (1, 0), (1, 1)])
+
+    def test_the_starting_port_is_honoured(self):
+        info = parse_machinereadable(self.SATA)
+        self.assertEqual(free_slots(info, "SATA", 4, 0, 2, start_port=2), [(3, 0)])
+
+    def test_nothing_wanted_is_nothing_allocated(self):
+        info = parse_machinereadable(self.SATA)
+        self.assertEqual(free_slots(info, "SATA", 4, 0, 0), [])
+
+
+class MultiAttachTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv[:1])
+
+    def _dialog(self, count):
+        media = [record(uuid=f"{i}" * 8, location=f"/vms/d{i}.vdi")
+                 for i in range(count)]
+        return AttachDialog(
+            "disk", media[0],
+            vms=[("vm1", "24aa0bbd-3d9c-4ba3-a41f-273c0ab57661")],
+            running=set(), capture=lambda args, cb: cb(0, VMINFO),
+            extra=media,
+        ), media
+
+    def test_one_command_per_medium_into_consecutive_free_slots(self):
+        dlg, media = self._dialog(3)
+        dlg._replan()
+        commands = dlg.commands()
+        self.assertEqual(len(commands), 3)
+        slots = [(c[c.index("--port") + 1], c[c.index("--device") + 1])
+                 for c in commands]
+        # VMINFO has port 0 occupied, so the batch starts at 1.
+        self.assertEqual(slots, [("1", "0"), ("2", "0"), ("3", "0")])
+        for command, medium in zip(commands, media):
+            self.assertIn(medium.uuid, command)
+
+    def test_a_single_medium_still_produces_a_single_command(self):
+        dlg, _media = self._dialog(1)
+        self.assertEqual(len(dlg.commands()), 1)
+        self.assertEqual(dlg.commands()[0], dlg.args())
+
+    def test_too_few_slots_is_refused_rather_than_truncated(self):
+        dlg, _media = self._dialog(6)
+        with mock.patch.object(QMessageBox, "warning") as warn:
+            dlg._ok()
+        warn.assert_called_once()
+        self.assertIn("free slot", warn.call_args[0][2])
+
+    def test_the_duplicate_focused_medium_is_not_attached_twice(self):
+        media = [record(uuid="1" * 8, location="/vms/a.vdi")]
+        dlg = AttachDialog(
+            "disk", media[0],
+            vms=[("vm1", "24aa0bbd-3d9c-4ba3-a41f-273c0ab57661")],
+            running=set(), capture=lambda args, cb: cb(0, VMINFO),
+            extra=media,
+        )
+        self.assertEqual(len(dlg.commands()), 1)
+
+
+class MultiPropertiesTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv[:1])
+
+    def test_a_shared_type_is_preselected_and_only_a_change_is_sent(self):
+        media = [record(uuid="1" * 8, medium_type="normal (base)"),
+                 record(uuid="2" * 8, medium_type="normal (base)")]
+        dlg = PropertiesDialog(media)
+        self.assertEqual(dlg.type_combo.currentText(), "normal")
+        dlg._ok()
+        self.assertEqual(dlg.commands("disk"), [])
+
+    def test_a_mixed_type_defaults_to_leaving_each_alone(self):
+        media = [record(uuid="1" * 8, medium_type="normal (base)"),
+                 record(uuid="2" * 8, medium_type="immutable (base)")]
+        dlg = PropertiesDialog(media)
+        self.assertEqual(dlg.type_combo.currentText(), MIXED_TYPE)
+        dlg._ok()
+        self.assertEqual(dlg.commands("disk"), [])
+
+    def test_setting_a_type_applies_it_to_every_medium(self):
+        media = [record(uuid="1" * 8, medium_type="normal (base)"),
+                 record(uuid="2" * 8, medium_type="immutable (base)")]
+        dlg = PropertiesDialog(media)
+        dlg.type_combo.setCurrentText("writethrough")
+        dlg._ok()
+        commands = dlg.commands("disk")
+        self.assertEqual(len(commands), 2)
+        for command, medium in zip(commands, media):
+            self.assertEqual(command[:3], ["modifymedium", "disk", medium.uuid])
+            self.assertEqual(command[-2:], ["--type", "writethrough"])
+
+    def test_an_empty_box_never_blanks_differing_descriptions(self):
+        # The dangerous default: a batch must not stamp the first medium's
+        # description — or an empty one — onto the rest.
+        media = [record(uuid="1" * 8, description="alpha"),
+                 record(uuid="2" * 8, description="beta")]
+        dlg = PropertiesDialog(media)
+        self.assertEqual(dlg.desc_edit.toPlainText(), "")
+        dlg._ok()
+        self.assertEqual(dlg.commands("disk"), [])
+
+    def test_typing_a_description_sets_it_on_all_of_them(self):
+        media = [record(uuid="1" * 8, description="alpha"),
+                 record(uuid="2" * 8, description="beta")]
+        dlg = PropertiesDialog(media)
+        dlg.desc_edit.setPlainText("shared note")
+        dlg._ok()
+        commands = dlg.commands("disk")
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(all(c[-2:] == ["--description", "shared note"]
+                            for c in commands))
+
+    def test_a_differencing_medium_in_the_selection_locks_the_type(self):
+        media = [record(uuid="1" * 8, medium_type="normal (base)"),
+                 record(uuid="2" * 8, medium_type="normal (differencing)")]
+        dlg = PropertiesDialog(media)
+        self.assertFalse(dlg.type_combo.isEnabled())
+
+    def test_a_single_medium_behaves_exactly_as_before(self):
+        dlg = PropertiesDialog(record(medium_type="normal (base)"))
+        dlg.type_combo.setCurrentText("immutable")
+        dlg._ok()
+        self.assertEqual(dlg.args("disk")[-2:], ["--type", "immutable"])
 
 
 if __name__ == "__main__":

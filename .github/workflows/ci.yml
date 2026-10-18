@@ -25,6 +25,18 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
 
+  e2e:
+    # The hermetic end-to-end suite: the real app driven against a stateful
+    # fake VBoxManage inside a container, with no network and no VirtualBox.
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the end-to-end image
+        run: docker build -f e2e/Dockerfile -t vboxfront-e2e .
+      - name: Run unit + end-to-end suites
+        run: docker run --rm --network none vboxfront-e2e
+
   build:
     runs-on: ubuntu-latest
     needs: test

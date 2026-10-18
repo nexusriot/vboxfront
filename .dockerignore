@@ -1,0 +1,12 @@
+# Keep the build context to the sources the image actually copies: a fat
+# context is uploaded to the daemon on every build, and none of this is.
+.git/
+.github/
+.idea/
+.venv/
+.vscode/
+build/
+dist/
+**/__pycache__/
+*.pyc
+*.deb

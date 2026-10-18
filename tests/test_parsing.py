@@ -7,6 +7,19 @@ import unittest
 
 from vboxfront import (
     CAP_DIFFERENCING,
+    MediumRecord,
+    is_destructive_command,
+    snapshot_only,
+    discard_findings,
+    parse_uuid_collision,
+    parse_filter,
+    record_matches,
+    medium_details,
+    plan_script,
+    eta_text,
+    format_duration,
+    registry_fingerprint,
+    registered_at,
     allocation_estimate,
     controller_types,
     format_bytes,
@@ -20,6 +33,7 @@ from vboxfront import (
     records_to_csv,
     records_to_json,
     records_to_tsv,
+    TRASH_DIR_NAME,
     scan_for_images,
     snapshot_word,
     space_warning,
@@ -721,8 +735,242 @@ class OrphanScanTest(unittest.TestCase):
             self.assertEqual(scan_for_images([d], [], recursive=False), [])
             self.assertEqual(len(scan_for_images([d], [], recursive=True)), 1)
 
+    def test_the_delete_trash_is_not_scanned(self):
+        # Offering to re-adopt an image the user has just deleted is the
+        # opposite of what this scan is for.
+        with tempfile.TemporaryDirectory() as d:
+            trash = os.path.join(d, TRASH_DIR_NAME)
+            os.makedirs(trash)
+            with open(os.path.join(trash, "deleted.vdi"), "w") as f:
+                f.write("x")
+            with open(os.path.join(d, "live.vdi"), "w") as f:
+                f.write("x")
+            self.assertEqual(scan_for_images([d], []),
+                             [("disk", os.path.join(d, "live.vdi"))])
+
     def test_a_missing_folder_is_skipped_quietly(self):
         self.assertEqual(scan_for_images(["/nonexistent-folder"], []), [])
+
+
+class UuidCollisionTest(unittest.TestCase):
+    """Why an image sits unregistered, in VBoxManage's own words.
+
+    Captured verbatim from 7.2.12 by copying a registered .vdi and asking it
+    to open the copy — the exact situation Image UUID tools exists for.
+    """
+
+    REFUSAL = (
+        "VBoxManage: error: Cannot register the hard disk "
+        "'/vms/copy.vdi' {c28bb89a-3214-4853-bf87-e26ceb0fdb31} because a "
+        "hard disk '/vms/probe.vdi' with UUID "
+        "{c28bb89a-3214-4853-bf87-e26ceb0fdb31} already exists\n"
+        "VBoxManage: error: Details: code NS_ERROR_INVALID_ARG\n"
+    )
+
+    def test_the_conflicting_file_and_uuid_are_named(self):
+        self.assertEqual(
+            parse_uuid_collision(self.REFUSAL),
+            ("/vms/probe.vdi", "c28bb89a-3214-4853-bf87-e26ceb0fdb31"),
+        )
+
+    def test_a_dvd_refusal_parses_too(self):
+        text = ("Cannot register the DVD image '/iso/copy.iso' {1} because a "
+                "DVD image '/iso/first.iso' with UUID "
+                "{11111111-2222-3333-4444-555555555555} already exists")
+        self.assertEqual(
+            parse_uuid_collision(text),
+            ("/iso/first.iso", "11111111-2222-3333-4444-555555555555"),
+        )
+
+    def test_a_clean_open_is_not_a_collision(self):
+        self.assertIsNone(parse_uuid_collision("UUID: 1234\nLocation: /x.vdi"))
+
+    def test_an_unrelated_error_is_not_a_collision(self):
+        self.assertIsNone(parse_uuid_collision(
+            "VBoxManage: error: Could not find file for the medium '/x.vdi'"
+        ))
+
+
+class StructuredFilterTest(unittest.TestCase):
+    """`fmt:vdi size:>10G vm:alpha` alongside plain substring matching."""
+
+    def _record(self, **over):
+        base = dict(uuid="aaaa-1", location="/vms/web.vdi", fmt="VDI",
+                    capacity="20480 MBytes", size_on_disk="15000 MBytes",
+                    medium_type="normal (base)", state="created",
+                    in_use=["alpha (UUID: 11111111-1111-1111-1111-111111111111)"])
+        base.update(over)
+        return MediumRecord(**base)
+
+    def _cells(self, rec):
+        return [os.path.basename(rec.location), rec.fmt, rec.capacity]
+
+    def test_terms_and_plain_words_are_separated(self):
+        terms, words = parse_filter("fmt:vdi size:>10G backup")
+        self.assertEqual(terms, [("fmt", "", "vdi"), ("size", ">", "10G")])
+        self.assertEqual(words, ["backup"])
+
+    def test_an_unknown_field_stays_a_plain_word(self):
+        # A pasted Windows path must keep filtering the way it always did.
+        terms, words = parse_filter("C:/VMs/disk.vdi")
+        self.assertEqual(terms, [])
+        self.assertEqual(words, ["c:/vms/disk.vdi"])
+
+    def test_every_term_has_to_match(self):
+        rec = self._record()
+        terms, words = parse_filter("fmt:vdi vm:alpha")
+        self.assertTrue(record_matches(rec, terms, words, self._cells(rec)))
+        terms, words = parse_filter("fmt:vdi vm:beta")
+        self.assertFalse(record_matches(rec, terms, words, self._cells(rec)))
+
+    def test_size_comparisons_use_the_allocated_size(self):
+        rec = self._record()
+        for query, expected in (("size:>10G", True), ("size:>20G", False),
+                                ("size:<20G", True), ("size:<1G", False)):
+            terms, words = parse_filter(query)
+            self.assertEqual(
+                record_matches(rec, terms, words, self._cells(rec)),
+                expected, query,
+            )
+
+    def test_capacity_is_its_own_field(self):
+        rec = self._record()
+        terms, words = parse_filter("capacity:>19G")
+        self.assertTrue(record_matches(rec, terms, words, self._cells(rec)))
+        terms, words = parse_filter("size:>19G")
+        self.assertFalse(record_matches(rec, terms, words, self._cells(rec)))
+
+    def test_an_unreadable_size_fails_a_size_term(self):
+        # "size:>10G" should not quietly include a medium whose size is
+        # unknown, which is exactly the inaccessible ones.
+        rec = self._record(size_on_disk="")
+        terms, words = parse_filter("size:>10G")
+        self.assertFalse(record_matches(rec, terms, words, self._cells(rec)))
+
+    def test_a_plain_word_still_matches_any_cell(self):
+        rec = self._record()
+        terms, words = parse_filter("web")
+        self.assertTrue(record_matches(rec, terms, words, self._cells(rec)))
+        terms, words = parse_filter("absent")
+        self.assertFalse(record_matches(rec, terms, words, self._cells(rec)))
+
+    def test_an_empty_filter_matches_everything(self):
+        rec = self._record()
+        terms, words = parse_filter("")
+        self.assertTrue(record_matches(rec, terms, words, self._cells(rec)))
+
+    def test_state_and_type_are_filterable(self):
+        rec = self._record(state="inaccessible")
+        terms, words = parse_filter("state:inaccessible")
+        self.assertTrue(record_matches(rec, terms, words, self._cells(rec)))
+        terms, words = parse_filter("type:normal")
+        self.assertTrue(record_matches(rec, terms, words, self._cells(rec)))
+
+
+class MediumDetailsTest(unittest.TestCase):
+    def test_the_rows_come_from_the_record_with_no_command(self):
+        (rec,) = parse_media_list(HDDS_ENCRYPTED)
+        rows = dict(medium_details(rec))
+        self.assertEqual(rows["UUID"], rec.uuid)
+        self.assertEqual(rows["Location"], "/vms/secret.vdi")
+        self.assertEqual(rows["Encryption"], "AES-XTS256-PLAIN64")
+        self.assertEqual(rows["Password ID"], "probeid")
+
+    def test_empty_fields_are_left_out_entirely(self):
+        rec = MediumRecord(uuid="u", location="/x.vdi", fmt="VDI",
+                           capacity="1 MBytes", size_on_disk="1 MBytes")
+        labels = [label for label, _value in medium_details(rec)]
+        self.assertNotIn("Description", labels)
+        self.assertNotIn("In use by", labels)
+        self.assertNotIn("Access error", labels)
+
+    def test_an_access_error_is_carried_through(self):
+        rec = MediumRecord(uuid="u", location="/x.vdi", fmt="VDI",
+                           capacity="1 MBytes", size_on_disk="1 MBytes",
+                           state="inaccessible",
+                           access_error="VERR_FILE_NOT_FOUND")
+        rows = dict(medium_details(rec))
+        self.assertEqual(rows["State"], "inaccessible")
+        self.assertIn("VERR_FILE_NOT_FOUND", rows["Access error"])
+
+
+class PlanScriptTest(unittest.TestCase):
+    def test_a_plan_is_a_runnable_script_with_every_argument_quoted(self):
+        script = plan_script([
+            ["modifymedium", "disk", "my disk", "--compact"],
+            ["closemedium", "disk", "x"],
+        ])
+        self.assertTrue(script.startswith("#!/bin/sh\n"))
+        self.assertIn("set -e", script)
+        self.assertIn("'my disk'", script)
+        self.assertEqual(script.count("closemedium"), 1)
+
+    def test_an_empty_plan_is_still_a_valid_script(self):
+        self.assertTrue(plan_script([]).startswith("#!/bin/sh"))
+
+
+class EtaTest(unittest.TestCase):
+    def test_durations_read_as_people_write_them(self):
+        self.assertEqual(format_duration(45), "45s")
+        self.assertEqual(format_duration(190), "3m10s")
+        self.assertEqual(format_duration(3900), "1h05m")
+        self.assertEqual(format_duration(-5), "0s")
+
+    def test_an_estimate_appears_once_there_is_something_to_estimate_from(self):
+        self.assertEqual(eta_text(50, 60), "1m00s · ~1m00s left")
+        self.assertEqual(eta_text(25, 30), "30s · ~1m30s left")
+
+    def test_nothing_is_guessed_too_early_to_be_meaningful(self):
+        # Below 5%, or in the first seconds, the number swings wildly enough
+        # that it is worse than no number.
+        self.assertEqual(eta_text(2, 60), "1m00s")
+        self.assertEqual(eta_text(50, 1), "1s")
+        self.assertEqual(eta_text(0, 60), "1m00s")
+
+    def test_a_finished_operation_shows_only_the_elapsed_time(self):
+        self.assertEqual(eta_text(100, 125), "2m05s")
+
+
+class RegistryFingerprintTest(unittest.TestCase):
+    def _record(self, **over):
+        base = dict(uuid="aaaa", location="/vms/a.vdi", fmt="VDI",
+                    capacity="100 MBytes", size_on_disk="10 MBytes")
+        base.update(over)
+        return MediumRecord(**base)
+
+    def test_the_same_registry_fingerprints_the_same_whatever_the_order(self):
+        a, b = self._record(), self._record(uuid="bbbb", location="/vms/b.vdi")
+        self.assertEqual(
+            registry_fingerprint({"disk": [a, b]}),
+            registry_fingerprint({"disk": [b, a]}),
+        )
+
+    def test_a_changed_capacity_changes_the_fingerprint(self):
+        self.assertNotEqual(
+            registry_fingerprint({"disk": [self._record()]}),
+            registry_fingerprint({"disk": [self._record(capacity="200 MBytes")]}),
+        )
+
+    def test_a_new_attachment_changes_the_fingerprint(self):
+        self.assertNotEqual(
+            registry_fingerprint({"disk": [self._record()]}),
+            registry_fingerprint({"disk": [self._record(in_use=["vm (UUID: x)"])]}),
+        )
+
+    def test_a_removed_medium_changes_the_fingerprint(self):
+        a = self._record()
+        self.assertNotEqual(
+            registry_fingerprint({"disk": [a]}),
+            registry_fingerprint({"disk": []}),
+        )
+
+    def test_a_description_alone_does_not_cry_wolf(self):
+        # Cosmetic fields are deliberately outside the digest: drift is about
+        # what an action keys off.
+        self.assertEqual(
+            registry_fingerprint({"disk": [self._record()]}),
+            registry_fingerprint({"disk": [self._record(description="note")]}),
+        )
 
 
 class HealthTest(unittest.TestCase):
@@ -733,6 +981,9 @@ class HealthTest(unittest.TestCase):
                 f.write("x")
             records = parse_media_list(SNAPSHOT_LISTING)
             records[0].location = path
+            # The fixture's medium is held by a snapshot, which is itself a
+            # finding; a genuinely clean registry has nothing holding it.
+            records[0].in_use = []
             self.assertEqual(health_findings({"disk": records}), [])
         self.assertEqual(health_report([]), "No problems found.\n")
 
@@ -751,8 +1002,106 @@ class HealthTest(unittest.TestCase):
         # medium, so a registered-but-deleted image still says "created".
         records = parse_media_list(SNAPSHOT_LISTING)
         findings = health_findings({"disk": records})
-        self.assertEqual([f.problem for f in findings],
-                         ["the backing file is missing"])
+        self.assertIn("missing-file", [f.code for f in findings])
+        missing = next(f for f in findings if f.code == "missing-file")
+        self.assertEqual(missing.problem, "the backing file is missing")
+
+    def test_a_snapshot_only_medium_is_reported_as_unreleasable(self):
+        # storageattach edits the current state only, so there is no slot to
+        # clear — the old behaviour was a "could not locate" that read like a
+        # bug in the app.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "snap.vdi")
+            with open(path, "w") as f:
+                f.write("x")
+            records = parse_media_list(SNAPSHOT_LISTING)
+            records[0].location = path
+            findings = health_findings({"disk": records})
+        codes = [f.code for f in findings]
+        self.assertEqual(codes, ["snapshot-only"])
+        self.assertIn("Before update", findings[0].problem)
+
+    def test_a_current_state_attachment_is_not_snapshot_only(self):
+        records = parse_media_list(SNAPSHOT_LISTING)
+        records[0].in_use = [
+            "win11 (UUID: 22222222-2222-2222-2222-222222222222)"
+        ]
+        self.assertFalse(snapshot_only(records[0]))
+
+    def test_a_mixed_attachment_is_not_snapshot_only(self):
+        # Held by a snapshot *and* the current state: the current-state slot
+        # is detachable, so the medium is not stuck.
+        records = parse_media_list(SNAPSHOT_LISTING)
+        records[0].in_use.append(
+            "win11 (UUID: 22222222-2222-2222-2222-222222222222)"
+        )
+        self.assertFalse(snapshot_only(records[0]))
+
+    def test_an_unattached_medium_is_not_snapshot_only(self):
+        records = parse_media_list(SNAPSHOT_LISTING)
+        records[0].in_use = []
+        self.assertFalse(snapshot_only(records[0]))
+
+    def test_a_disk_attached_without_discard_is_flagged(self):
+        # The usual reason a compact gives nothing back: without --discard the
+        # guest's TRIM never reaches the image, so freed blocks stay
+        # allocated and there is nothing for modifymedium --compact to find.
+        records = parse_media_list(SNAPSHOT_LISTING)
+        uuid = records[0].uuid
+        info = parse_machinereadable(
+            'name="win11"\n'
+            'storagecontrollername0="SATA"\n'
+            'storagecontrollerportcount0="2"\n'
+            f'"SATA-ImageUUID-0-0"="{uuid}"\n'
+            '"SATA-discard-0-0"="off"\n'
+        )
+        findings = discard_findings({"disk": records}, {"vm": info})
+        self.assertEqual([f.code for f in findings], ["no-discard"])
+        self.assertIn("win11", findings[0].problem)
+
+    def test_discard_on_is_not_flagged(self):
+        records = parse_media_list(SNAPSHOT_LISTING)
+        uuid = records[0].uuid
+        info = parse_machinereadable(
+            'name="win11"\n'
+            'storagecontrollername0="SATA"\n'
+            'storagecontrollerportcount0="2"\n'
+            f'"SATA-ImageUUID-0-0"="{uuid}"\n'
+            '"SATA-discard-0-0"="on"\n'
+        )
+        self.assertEqual(discard_findings({"disk": records}, {"vm": info}), [])
+
+    def test_an_unattached_disk_is_not_flagged(self):
+        records = parse_media_list(SNAPSHOT_LISTING)
+        info = parse_machinereadable(
+            'name="win11"\n'
+            'storagecontrollername0="SATA"\n'
+            'storagecontrollerportcount0="2"\n'
+            '"SATA-0-0"="none"\n'
+        )
+        self.assertEqual(discard_findings({"disk": records}, {"vm": info}), [])
+
+    def test_one_disk_in_two_vms_is_reported_once_each(self):
+        records = parse_media_list(SNAPSHOT_LISTING)
+        uuid = records[0].uuid
+
+        def vm(name):
+            return parse_machinereadable(
+                f'name="{name}"\n'
+                'storagecontrollername0="SATA"\n'
+                'storagecontrollerportcount0="2"\n'
+                f'"SATA-ImageUUID-0-0"="{uuid}"\n'
+                '"SATA-discard-0-0"="off"\n'
+            )
+
+        findings = discard_findings({"disk": records},
+                                    {"a": vm("alpha"), "b": vm("beta")})
+        self.assertEqual(len(findings), 2)
+        self.assertEqual(
+            sorted(f.problem for f in findings),
+            ["attached to alpha without --discard",
+             "attached to beta without --discard"],
+        )
 
     def test_an_unregistered_parent_is_reported(self):
         with tempfile.TemporaryDirectory() as d:
@@ -787,6 +1136,139 @@ class ReclaimTest(unittest.TestCase):
     def test_an_unknown_size_reports_nothing(self):
         self.assertEqual(reclaim_line("a.vdi", None, 100), "")
         self.assertEqual(reclaim_line("a.vdi", 100, None), "")
+
+
+class DescriptionBlankLineTest(unittest.TestCase):
+    """A Description whose blank line is followed by a "UUID:" line.
+
+    VBoxManage prints description continuations flush left, so the shape alone
+    cannot tell them from the start of the next record. Taking the blank line
+    as proof used to drop the real medium (it never reached its Location) and
+    put a phantom in its place whose UUID carried an embedded newline — which
+    then went into whatever command the user ran on that row.
+    """
+
+    LISTING = """\
+UUID:           aaaaaaaa-1111-1111-1111-111111111111
+Parent UUID:    base
+State:          created
+Description:    cloned from
+
+UUID:           deadbeef-0000-0000-0000-000000000000
+and resized afterwards
+Type:           normal (base)
+Location:       /vms/probe.vdi
+Storage format: VDI
+Capacity:       100 MBytes
+Size on disk:   1 MBytes
+"""
+
+    def test_the_medium_is_not_replaced_by_a_phantom(self):
+        records = parse_media_list(self.LISTING)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].uuid, "aaaaaaaa-1111-1111-1111-111111111111")
+        self.assertEqual(records[0].location, "/vms/probe.vdi")
+
+    def test_no_uuid_ever_contains_a_newline(self):
+        for record in parse_media_list(self.LISTING):
+            self.assertNotIn("\n", record.uuid)
+
+    def test_the_quoted_uuid_stays_in_the_description(self):
+        (record,) = parse_media_list(self.LISTING)
+        self.assertIn("deadbeef-0000-0000-0000-000000000000", record.description)
+        self.assertIn("and resized afterwards", record.description)
+
+    def test_a_complete_record_still_ends_at_the_blank_line(self):
+        # The guard must not weld two real records together: once a record has
+        # a Location it is one VBoxManage could have finished printing.
+        two = self.LISTING + """
+UUID:           bbbbbbbb-2222-2222-2222-222222222222
+Parent UUID:    base
+State:          created
+Type:           normal (base)
+Location:       /vms/next.vdi
+Storage format: VDI
+Capacity:       32 MBytes
+"""
+        records = parse_media_list(two)
+        self.assertEqual(
+            [r.uuid for r in records],
+            ["aaaaaaaa-1111-1111-1111-111111111111",
+             "bbbbbbbb-2222-2222-2222-222222222222"],
+        )
+
+
+class DestructiveCommandTest(unittest.TestCase):
+    """What the history dialog demands the word RUN for."""
+
+    def test_clone_into_an_existing_image_is_destructive(self):
+        # Every other clonemedium refuses a target that exists, so a replay can
+        # only fail; --existing writes into the image that is already there.
+        self.assertTrue(is_destructive_command(
+            "VBoxManage clonemedium disk src.vdi dst.vdi --existing"
+        ))
+
+    def test_a_plain_clone_is_not(self):
+        self.assertFalse(is_destructive_command(
+            "VBoxManage clonemedium disk src.vdi dst.vdi --format VDI"
+        ))
+
+    def test_mediumio_writing_to_a_file_is_destructive(self):
+        # mediumio overwrites --output without asking; the dialog confirms it
+        # the first time round and a replay would skip that.
+        self.assertTrue(is_destructive_command(
+            "VBoxManage mediumio --disk=x cat --output=/home/me/notes.bin --size=512"
+        ))
+
+    def test_a_hex_dump_to_the_panel_is_not(self):
+        self.assertFalse(is_destructive_command(
+            "VBoxManage mediumio --disk=x cat --hex --size=512"
+        ))
+
+    def test_output_to_stdout_is_not(self):
+        self.assertFalse(is_destructive_command(
+            "VBoxManage mediumio --disk=x cat --output=- --size=512"
+        ))
+
+    def test_reading_commands_stay_replayable_without_a_typed_guard(self):
+        for command in (
+            "VBoxManage list -l hdds",
+            "VBoxManage showmediuminfo disk 7894924d-30ae-41ec-a640-98cdba451f17",
+            "VBoxManage internalcommands repairhd -dry-run -format VDI /vms/a.vdi",
+        ):
+            self.assertFalse(is_destructive_command(command), command)
+
+
+class RegisteredAtTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="vboxfront-registered-")
+        self.path = os.path.join(self.dir, "disk.vdi")
+        with open(self.path, "wb") as handle:
+            handle.write(b"x")
+        self.record = MediumRecord(
+            uuid="aaaaaaaa-1111-1111-1111-111111111111", location=self.path,
+            fmt="VDI", capacity="100 MBytes", size_on_disk="1 MBytes",
+        )
+
+    def test_finds_the_medium_backed_by_a_path(self):
+        found = registered_at(self.path, [self.record])
+        self.assertIsNotNone(found)
+        self.assertEqual(found.uuid, self.record.uuid)
+
+    def test_excludes_the_uuid_it_is_told_to(self):
+        self.assertIsNone(
+            registered_at(self.path, [self.record], exclude=self.record.uuid)
+        )
+
+    def test_matches_through_a_symlink(self):
+        link = os.path.join(self.dir, "link.vdi")
+        os.symlink(self.path, link)
+        self.assertIsNotNone(registered_at(link, [self.record]))
+
+    def test_an_unknown_path_is_not_registered(self):
+        self.assertIsNone(
+            registered_at(os.path.join(self.dir, "other.vdi"), [self.record])
+        )
 
 
 if __name__ == "__main__":

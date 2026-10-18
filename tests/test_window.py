@@ -3,6 +3,7 @@
 import csv
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -12,12 +13,18 @@ from unittest import mock
 
 import vboxfront
 
-from PyQt6.QtCore import QByteArray
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import QByteArray, Qt
+
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from vboxfront import (
     COLUMNS,
+    TRASH_DIR_NAME,
+    TrashedFile,
+    move_to_trash,
+    restore_trashed,
+    trash_dir_for,
+    user_trash_dir,
     COL_SNAPSHOT,
     OrphanScanDialog,
     RemoveDialog,
@@ -40,6 +47,8 @@ from vboxfront import (
     load_history,
     load_library,
     save_library,
+    plan_script,
+    set_plan_mode,
     write_secret_file,
 )
 
@@ -119,7 +128,7 @@ class FakeVBoxManageTest(unittest.TestCase):
         self.workdir = tempfile.mkdtemp(prefix="vboxfront-fake-")
         self.log = os.path.join(self.workdir, "calls.log")
         self.fake = os.path.join(self.workdir, "VBoxManage")
-        hdds = HDDS_OUTPUT
+        hdds = self.hdds_output()
         script = (
             "#!/bin/sh\n"
             f'echo "$*" >> "{self.log}"\n'
@@ -140,6 +149,8 @@ class FakeVBoxManageTest(unittest.TestCase):
             f.write(script)
         os.chmod(self.fake, os.stat(self.fake).st_mode | stat.S_IXUSR)
         get_settings().setValue("vboxmanage_path", self.fake)
+        get_settings().remove("trash/enabled")
+        get_settings().remove("trash/dir")
         for kind in KINDS:
             save_library(kind, [])
         self.window = None
@@ -155,7 +166,18 @@ class FakeVBoxManageTest(unittest.TestCase):
             self.window.close()
             self.window.deleteLater()
         get_settings().setValue("vboxmanage_path", "")
+        get_settings().remove("trash/enabled")
+        get_settings().remove("trash/dir")
         QApplication.processEvents()
+
+    def hdds_output(self) -> str:
+        """What the fake prints for `list -l hdds`.
+
+        A hook rather than a constant so a suite that has to act on the files
+        themselves — the delete trash does — can list images it really put on
+        disk, in the same temp directory the rest of the fixture uses.
+        """
+        return HDDS_OUTPUT
 
     def make_window(self) -> MainWindow:
         self.window = MainWindow()
@@ -165,6 +187,13 @@ class FakeVBoxManageTest(unittest.TestCase):
             "initial refresh did not populate the disk pane",
         )
         return self.window
+
+    def calls_log(self) -> list[str]:
+        try:
+            with open(self.log) as handle:
+                return [line.rstrip("\n") for line in handle]
+        except OSError:
+            return []
 
     def top_level_names(self, pane) -> list[str]:
         return [
@@ -195,7 +224,7 @@ class MainWindowTest(FakeVBoxManageTest):
         w = self.make_window()
         pane = w.panes["disk"]
         gone = next(i for i in pane._iter_items() if i.text(0) == "gone.vdi")
-        self.assertEqual(gone.foreground(0).color(), QColor(220, 80, 80))
+        self.assertEqual(gone.foreground(0).color(), vboxfront.error_color())
         self.assertEqual(gone.text(COL_STATE), "inaccessible")
         self.assertIn("VERR_FILE_NOT_FOUND", gone.toolTip(COL_STATE))
 
@@ -728,6 +757,255 @@ class BatchOperationTest(FakeVBoxManageTest):
         )
 
 
+REAL_FILE_HDDS = """\
+UUID:           11111111-1111-1111-1111-111111111111
+Parent UUID:    base
+State:          created
+Type:           normal (base)
+Location:       {first}
+Storage format: VDI
+Capacity:       64 MBytes
+Size on disk:   1 MBytes
+
+UUID:           22222222-2222-2222-2222-222222222222
+Parent UUID:    base
+State:          created
+Type:           normal (base)
+Location:       {second}
+Storage format: VDI
+Capacity:       64 MBytes
+Size on disk:   1 MBytes
+"""
+
+FIRST_UUID = "11111111-1111-1111-1111-111111111111"
+SECOND_UUID = "22222222-2222-2222-2222-222222222222"
+
+
+class TrashHelperTest(unittest.TestCase):
+    """The file moves themselves, without a window in the way."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="vboxfront-trash-")
+        get_settings().remove("trash/dir")
+        get_settings().remove("trash/enabled")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+        get_settings().remove("trash/dir")
+        get_settings().remove("trash/enabled")
+
+    def _image(self, name: str, body: bytes = b"disk") -> str:
+        path = os.path.join(self.dir, name)
+        with open(path, "wb") as handle:
+            handle.write(body)
+        return path
+
+    def test_the_default_trash_sits_beside_the_image(self):
+        path = self._image("a.vdi")
+        self.assertEqual(
+            trash_dir_for(path), os.path.join(self.dir, TRASH_DIR_NAME)
+        )
+
+    def test_a_configured_folder_wins(self):
+        elsewhere = os.path.join(self.dir, "elsewhere")
+        get_settings().setValue("trash/dir", elsewhere)
+        self.assertEqual(trash_dir_for(self._image("a.vdi")), elsewhere)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "root ignores the permission bit this test sets")
+    def test_an_unwritable_folder_falls_back_to_the_user_directory(self):
+        path = self._image("a.vdi")
+        locked = os.path.join(self.dir, "locked")
+        os.makedirs(locked)
+        inside = os.path.join(locked, "a.vdi")
+        os.rename(path, inside)
+        os.chmod(locked, 0o500)
+        try:
+            self.assertEqual(trash_dir_for(inside), user_trash_dir())
+        finally:
+            os.chmod(locked, 0o700)
+
+    def test_a_second_file_of_the_same_name_does_not_overwrite_the_first(self):
+        first = move_to_trash(self._image("same.vdi", b"first"))
+        # A second disk with the same basename, from another folder.
+        other = os.path.join(self.dir, "other")
+        os.makedirs(other)
+        second_src = os.path.join(other, "same.vdi")
+        with open(second_src, "wb") as handle:
+            handle.write(b"second")
+        get_settings().setValue("trash/dir", os.path.dirname(first))
+
+        second = move_to_trash(second_src)
+        self.assertNotEqual(first, second)
+        with open(first, "rb") as handle:
+            self.assertEqual(handle.read(), b"first", "the trash ate its own")
+        with open(second, "rb") as handle:
+            self.assertEqual(handle.read(), b"second")
+
+    def test_restoring_refuses_to_write_over_what_is_there_now(self):
+        path = self._image("busy.vdi", b"old")
+        entry = TrashedFile("disk", path, move_to_trash(path))
+        with open(path, "wb") as handle:
+            handle.write(b"new")
+
+        with self.assertRaises(OSError):
+            restore_trashed(entry)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"new", "undo clobbered a new file")
+        self.assertTrue(os.path.exists(entry.trashed), "the old file was lost")
+
+
+class TrashDeleteTest(FakeVBoxManageTest):
+    """Delete moves the backing file aside, and Undo delete puts it back."""
+
+    def hdds_output(self) -> str:
+        self.images = os.path.join(self.workdir, "images")
+        os.makedirs(self.images, exist_ok=True)
+        self.first = os.path.join(self.images, "first.vdi")
+        self.second = os.path.join(self.images, "second.vdi")
+        for path in (self.first, self.second):
+            with open(path, "wb") as handle:
+                handle.write(os.path.basename(path).encode())
+        return REAL_FILE_HDDS.format(first=self.first, second=self.second)
+
+    @property
+    def trash(self) -> str:
+        return os.path.join(self.images, TRASH_DIR_NAME)
+
+    def select(self, w, *uuids):
+        pane = w.panes["disk"]
+        pane.tree.clearSelection()
+        for item in pane._iter_items():
+            if item.data(COL_NAME, Qt.ItemDataRole.UserRole) in uuids:
+                item.setSelected(True)
+        self.assertEqual(len(pane.selected_records()), len(uuids))
+        return pane
+
+    def delete_selected(self, w):
+        """Drive Remove through the real dialog, choosing "delete the file"."""
+        def fake_exec(dlg):
+            dlg.mode.setCurrentIndex(1)
+            with mock.patch.object(QMessageBox, "warning",
+                                   return_value=QMessageBox.StandardButton.Yes):
+                dlg._ok()
+            return int(dlg.delete_file)
+
+        with mock.patch.object(RemoveDialog, "exec", fake_exec):
+            w.remove_selected()
+        self.assertTrue(
+            wait_until(lambda: not w.runner.is_busy() and not w._cmd_queue
+                       and not w._refreshing),
+            "the remove queue did not drain",
+        )
+
+    def calls(self) -> list[str]:
+        with open(self.log) as handle:
+            return [line.rstrip("\n") for line in handle]
+
+    def test_delete_moves_the_file_into_the_trash_instead_of_unlinking_it(self):
+        w = self.make_window()
+        self.select(w, FIRST_UUID)
+        self.delete_selected(w)
+
+        self.assertFalse(os.path.exists(self.first), "the file was left in place")
+        landed = os.path.join(self.trash, "first.vdi")
+        self.assertTrue(os.path.exists(landed), "nothing reached the trash")
+        closes = [c for c in self.calls() if "closemedium" in c]
+        self.assertEqual(len(closes), 1)
+        self.assertNotIn("--delete", closes[0],
+                         "VBoxManage was still asked to unlink the file")
+        self.assertIn(landed, w.runner.output.toPlainText(),
+                      "the output panel never said where the file went")
+
+    def test_undo_puts_the_file_and_the_library_entry_back(self):
+        w = self.make_window()
+        save_library("disk", [self.first])
+        self.select(w, FIRST_UUID)
+        self.delete_selected(w)
+        self.assertEqual(load_library("disk"), [])
+        self.assertTrue(w.act_undo_delete.isEnabled())
+
+        w.undo_delete()
+        self.assertTrue(wait_until(lambda: not w._refreshing))
+
+        self.assertTrue(os.path.exists(self.first), "the file never came back")
+        with open(self.first, "rb") as handle:
+            self.assertEqual(handle.read(), b"first.vdi", "a different file came back")
+        self.assertIn(self.first, load_library("disk"),
+                      "the row cannot return without its library entry")
+        self.assertFalse(w.act_undo_delete.isEnabled(),
+                         "the trash is empty but Undo delete is still offered")
+
+    def test_a_batch_delete_undoes_as_one(self):
+        w = self.make_window()
+        self.select(w, FIRST_UUID, SECOND_UUID)
+        self.delete_selected(w)
+        self.assertEqual(sorted(os.listdir(self.trash)), ["first.vdi", "second.vdi"])
+        self.assertFalse(os.path.exists(self.first))
+        self.assertFalse(os.path.exists(self.second))
+
+        w.undo_delete()
+        self.assertTrue(wait_until(lambda: not w._refreshing))
+
+        self.assertTrue(os.path.exists(self.first))
+        self.assertTrue(os.path.exists(self.second), "only half the batch came back")
+        self.assertEqual(sorted(load_library("disk")), sorted([self.first, self.second]))
+        self.assertFalse(w.act_undo_delete.isEnabled())
+
+    def test_turning_the_trash_off_sends_a_real_delete(self):
+        get_settings().setValue("trash/enabled", False)
+        w = self.make_window()
+        self.select(w, FIRST_UUID)
+        self.delete_selected(w)
+
+        closes = [c for c in self.calls() if "closemedium" in c]
+        self.assertEqual(len(closes), 1)
+        self.assertIn("--delete", closes[0], "VBoxManage was never asked to delete")
+        self.assertFalse(os.path.isdir(self.trash), "a trash folder was made anyway")
+        self.assertFalse(w.act_undo_delete.isEnabled(),
+                         "an unlinked file cannot be undone")
+
+    def test_a_configured_trash_folder_is_where_the_file_lands(self):
+        elsewhere = os.path.join(self.workdir, "bin")
+        get_settings().setValue("trash/dir", elsewhere)
+        w = self.make_window()
+        self.select(w, FIRST_UUID)
+        self.delete_selected(w)
+
+        self.assertEqual(os.listdir(elsewhere), ["first.vdi"])
+        self.assertFalse(os.path.isdir(self.trash))
+
+    def test_unregistering_without_delete_leaves_the_file_alone(self):
+        w = self.make_window()
+        self.select(w, FIRST_UUID)
+        with mock.patch.object(RemoveDialog, "exec", return_value=1):
+            w.remove_selected()
+        self.assertTrue(
+            wait_until(lambda: not w.runner.is_busy() and not w._cmd_queue
+                       and not w._refreshing)
+        )
+        self.assertTrue(os.path.exists(self.first))
+        self.assertFalse(os.path.isdir(self.trash))
+        self.assertFalse(w.act_undo_delete.isEnabled())
+
+    def test_a_file_that_cannot_be_put_back_stays_undoable(self):
+        w = self.make_window()
+        self.select(w, FIRST_UUID)
+        self.delete_selected(w)
+        # Something else is at the old path now; the undo must not erase it.
+        with open(self.first, "wb") as handle:
+            handle.write(b"newer")
+
+        with mock.patch.object(QMessageBox, "warning") as warn:
+            w.undo_delete()
+        warn.assert_called_once()
+        with open(self.first, "rb") as handle:
+            self.assertEqual(handle.read(), b"newer")
+        self.assertTrue(os.path.exists(os.path.join(self.trash, "first.vdi")))
+        self.assertTrue(w.act_undo_delete.isEnabled(),
+                        "a failed undo threw the file away")
+
+
 class ListingExportTest(FakeVBoxManageTest):
     def test_export_writes_every_row_of_the_tab(self):
         w = self.make_window()
@@ -860,7 +1138,7 @@ class HealthAndScanTest(FakeVBoxManageTest):
         with self._accepted_dialog(
             "HealthDialog",
             reveal=("disk", "dddddddd-4444-4444-4444-444444444444"),
-            dry_run_paths=[],
+            dry_run_paths=[], prune=[], want_discard_scan=False,
         ):
             w.open_health()
         self.assertEqual(w.current_kind(), "disk")
@@ -870,7 +1148,10 @@ class HealthAndScanTest(FakeVBoxManageTest):
     def test_the_dry_run_queues_one_read_only_check_per_vdi(self):
         w = self.make_window()
         paths = ["/fake/base.vdi", "/fake/child.vdi"]
-        with self._accepted_dialog("HealthDialog", reveal=None, dry_run_paths=paths):
+        with self._accepted_dialog(
+            "HealthDialog", reveal=None, dry_run_paths=paths,
+            prune=[], want_discard_scan=False,
+        ):
             w.open_health()
         self.assertTrue(
             wait_until(lambda: not w.runner.is_busy() and not w._cmd_queue
@@ -896,8 +1177,9 @@ class HealthAndScanTest(FakeVBoxManageTest):
         add_library_path("floppy", "/fake/boot.img")
         captured = {}
 
-        def fake_init(dlg_self, known, parent=None):
+        def fake_init(dlg_self, known, parent=None, capture=None):
             captured["known"] = known
+            captured["capture"] = capture
             OrphanScanDialog.__mro__[1].__init__(dlg_self, parent)
             dlg_self.chosen = []
 
@@ -906,6 +1188,8 @@ class HealthAndScanTest(FakeVBoxManageTest):
             w.open_orphan_scan()
         self.assertIn("/fake/base.vdi", captured["known"], "registered media")
         self.assertIn("/fake/boot.img", captured["known"], "library entries")
+        self.assertIsNotNone(captured["capture"],
+                             "the scan needs a capture to explain collisions")
 
 
 class SnapshotColumnTest(FakeVBoxManageTest):
@@ -922,6 +1206,389 @@ class SnapshotColumnTest(FakeVBoxManageTest):
         base = next(i for i in pane._iter_items() if i.text(COL_NAME) == "base.vdi")
         self.assertEqual(base.text(COL_SNAPSHOT), "Before update")
         self.assertEqual(base.text(COL_IN_USE), "vbf-smoke")
+
+
+class ParentChainCycleTest(unittest.TestCase):
+    """A medium never disappears, whatever its Parent UUID says.
+
+    `sethdparentuuid` will stamp any UUID into an image, its own included, and
+    a chain that loops left every medium in it out of `roots` — so nothing
+    drew the row while the totals line went on counting it. An image that is
+    not on screen cannot be selected, inspected or repaired.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(sys.argv[:1])
+
+    @staticmethod
+    def _record(uuid, parent):
+        return vboxfront.MediumRecord(
+            uuid=uuid, location=f"/vms/{uuid}.vdi", fmt="VDI",
+            capacity="100 MBytes", size_on_disk="1 MBytes", parent_uuid=parent,
+        )
+
+    def _uuids(self, pane):
+        return {
+            item.data(COL_NAME, Qt.ItemDataRole.UserRole)
+            for item in pane._iter_items()
+        }
+
+    def test_a_self_parent_still_gets_a_row(self):
+        pane = vboxfront.MediaPane("disk")
+        pane.populate([self._record("aaaa", "aaaa")])
+        self.assertEqual(self._uuids(pane), {"aaaa"})
+        self.assertNotIn("shown", pane.totals.text())
+
+    def test_a_two_medium_cycle_still_gets_both_rows(self):
+        pane = vboxfront.MediaPane("disk")
+        pane.populate([self._record("aaaa", "bbbb"), self._record("bbbb", "aaaa")])
+        self.assertEqual(self._uuids(pane), {"aaaa", "bbbb"})
+
+    def test_a_normal_chain_is_still_nested_under_its_parent(self):
+        pane = vboxfront.MediaPane("disk")
+        pane.populate([self._record("aaaa", "base"), self._record("bbbb", "aaaa")])
+        self.assertEqual(pane.tree.topLevelItemCount(), 1)
+        self.assertEqual(pane.tree.topLevelItem(0).childCount(), 1)
+
+
+class ResizeParentGuardTest(FakeVBoxManageTest):
+    def test_resizing_a_disk_with_children_says_why_rather_than_failing(self):
+        # VirtualBox answers "Write access denied: read-only" for a medium that
+        # has differencing children; naming the child beats passing that on.
+        w = self.make_window()
+        # A saved tab index from an earlier test would otherwise decide which
+        # pane the action reads.
+        w.tabs.setCurrentIndex(KINDS.index("disk"))
+        pane = w.panes["disk"]
+        pane.select_uuid("aaaaaaaa-1111-1111-1111-111111111111")
+        pane.selected_record().in_use = []
+        with mock.patch.object(QMessageBox, "warning") as warn:
+            w.resize_selected()
+        warn.assert_called_once()
+        self.assertIn("child.vdi", warn.call_args[0][2])
+        with open(self.log) as f:
+            self.assertNotIn("--resize", f.read())
+
+
+class ExportExtensionTest(FakeVBoxManageTest):
+    """A typed extension beats the filter combo that happened to be showing."""
+
+    def _export_to(self, path, chosen):
+        w = self.make_window()
+        w.tabs.setCurrentIndex(KINDS.index("disk"))
+        with mock.patch.object(
+            vboxfront.QFileDialog, "getSaveFileName", return_value=(path, chosen)
+        ):
+            w.export_listing()
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_a_csv_name_under_the_json_filter_writes_csv(self):
+        path = os.path.join(self.workdir, "listing.csv")
+        text = self._export_to(path, "JSON (*.json)")
+        self.assertTrue(text.startswith("name,format,"), text[:40])
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(text)
+
+    def test_a_json_name_under_the_csv_filter_writes_json(self):
+        path = os.path.join(self.workdir, "listing.json")
+        rows = json.loads(self._export_to(path, "CSV (*.csv)"))
+        self.assertTrue(any(r["name"] == "base.vdi" for r in rows))
+
+    def test_a_bare_name_follows_the_chosen_filter(self):
+        base = os.path.join(self.workdir, "listing")
+        w = self.make_window()
+        w.tabs.setCurrentIndex(KINDS.index("disk"))
+        with mock.patch.object(
+            vboxfront.QFileDialog, "getSaveFileName",
+            return_value=(base, "JSON (*.json)"),
+        ):
+            w.export_listing()
+        self.assertTrue(os.path.exists(base + ".json"))
+
+
+class SecretShreddingOnQuitTest(FakeVBoxManageTest):
+    def test_quitting_mid_command_removes_the_password_files(self):
+        # QProcess.finished is what normally triggers the shred, and quitting
+        # kills the process without it ever arriving.
+        w = self.make_window()
+        secret = write_secret_file("hunter2")
+        self.assertTrue(os.path.exists(secret))
+        w.runner.run(["hang"], secret_files=[secret])
+        self.assertTrue(wait_until(lambda: w.runner.is_busy()))
+        with mock.patch.object(QMessageBox, "question",
+                               return_value=QMessageBox.StandardButton.Yes):
+            w.close()
+        self.assertFalse(os.path.exists(secret))
+        # The kill arrives as a `finished` signal that kicks off one more
+        # refresh; let it finish against the fake rather than leaving a live
+        # QProcess for the next test to inherit.
+        wait_until(lambda: not w.runner.is_busy() and not w._refreshing)
+
+
+class VisibleQueueTest(FakeVBoxManageTest):
+    """A batch says what is left, and lets the rest go."""
+
+    def _queued_compact(self, w, count=3):
+        pane = w.panes["disk"]
+        w.tabs.setCurrentIndex(KINDS.index("disk"))
+        entries = [(["hang"], None, None) for _ in range(count)]
+        return entries
+
+    def test_the_queue_panel_lists_what_is_still_waiting(self):
+        w = self.make_window()
+        w._run_queue([(["modifymedium", "disk", f"uuid-{i}", "--compact"], None, None)
+                      for i in range(4)])
+        self.assertTrue(w.runner.queue_row_host.isVisibleTo(w.runner))
+        self.assertEqual(w.runner.queue_list.count(), 3, "three left behind one")
+        self.assertIn("uuid-1", w.runner.queue_list.item(0).text())
+        self.assertTrue(wait_until(
+            lambda: not w.runner.is_busy() and not w._cmd_queue and not w._refreshing))
+        self.assertEqual(w.runner.queue_list.count(), 0, "drained queue still shown")
+
+    def test_skipping_drops_the_rest_and_leaves_the_running_one(self):
+        w = self.make_window()
+        w._run_queue([(["hang"], None, None)]
+                     + [(["modifymedium", "disk", "x", "--compact"], None, None)] * 3)
+        self.assertTrue(wait_until(lambda: w.runner.is_busy()))
+        self.assertEqual(len(w._cmd_queue), 3)
+
+        w.runner.skip_btn.click()
+
+        self.assertEqual(w._cmd_queue, [])
+        self.assertIn("[queue] skipped 3", w.runner.output.toPlainText())
+        self.assertTrue(w.runner.is_busy(), "the running command must be left alone")
+        w.runner.cancel()
+        self.assertTrue(wait_until(
+            lambda: not w.runner.is_busy() and not w._refreshing))
+
+
+class PlanModeTest(FakeVBoxManageTest):
+    def tearDown(self):
+        set_plan_mode(False)
+        super().tearDown()
+
+    def test_plan_mode_shows_the_commands_and_runs_nothing(self):
+        w = self.make_window()
+        set_plan_mode(True)
+        before = len(self.calls_log())
+        with mock.patch.object(vboxfront.PlanDialog, "exec", return_value=0):
+            started = w._run_queue(
+                [(["modifymedium", "disk", "x", "--compact"], None, None)])
+        self.assertFalse(started)
+        self.assertEqual(len(self.calls_log()), before, "plan mode ran something")
+
+    def test_choosing_run_from_the_plan_goes_ahead(self):
+        w = self.make_window()
+        set_plan_mode(True)
+        with mock.patch.object(vboxfront.PlanDialog, "exec",
+                               return_value=vboxfront.PlanDialog.RUN):
+            started = w._run_queue(
+                [(["modifymedium", "disk", "x", "--compact"], None, None)])
+        self.assertTrue(started)
+        self.assertTrue(wait_until(
+            lambda: not w.runner.is_busy() and not w._refreshing))
+        self.assertTrue(any("--compact" in c for c in self.calls_log()))
+
+    def test_the_script_quotes_every_argument(self):
+        script = plan_script([["modifymedium", "disk", "a b", "--compact"]])
+        self.assertIn("'a b'", script)
+        self.assertTrue(script.startswith("#!/bin/sh"))
+        self.assertIn("set -e", script)
+
+
+class RegistrySnapshotTest(FakeVBoxManageTest):
+    def test_a_remove_writes_the_registry_aside_first(self):
+        w = self.make_window()
+        w.tabs.setCurrentIndex(KINDS.index("disk"))
+        pane = w.panes["disk"]
+        pane.select_uuid("cccccccc-3333-3333-3333-333333333333")
+
+        class Stub:
+            delete_file = False
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def exec(self):
+                return 1
+
+        with mock.patch("vboxfront.RemoveDialog", Stub):
+            w.remove_selected()
+        self.assertTrue(wait_until(
+            lambda: not w.runner.is_busy() and not w._cmd_queue and not w._refreshing))
+
+        written = [f for f in os.listdir(vboxfront.snapshot_dir())
+                   if f.endswith("-remove-media.json")]
+        self.assertTrue(written, "no registry snapshot was written")
+        with open(os.path.join(vboxfront.snapshot_dir(), written[-1]),
+                  encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.assertEqual(payload["reason"], "remove media")
+        names = [row["name"] for row in payload["media"]["disk"]]
+        self.assertIn("other.vmdk", names)
+        self.assertIn("uuid", payload["media"]["disk"][0])
+
+    def test_a_snapshot_that_cannot_be_written_does_not_stop_anything(self):
+        w = self.make_window()
+        with mock.patch.object(vboxfront, "write_registry_snapshot",
+                               return_value=""):
+            w._snapshot_registry("probe")
+        self.assertIn("could not write a registry snapshot",
+                      w.runner.output.toPlainText())
+
+
+class LibraryProbeCacheTest(FakeVBoxManageTest):
+    """One `showmediuminfo` per library entry per refresh was the cost of F5.
+
+    Both halves of the cache matter: the stamp comes from the filesystem, and
+    an entry may only be skipped when the last listing actually showed it — a
+    registration VBoxSVC has forgotten has to be made again.
+    """
+
+    def hdds_output(self) -> str:
+        # A real file that the listing also reports, which is what a library
+        # entry looks like once `showmediuminfo` has opened it.
+        self.lib_path = os.path.join(self.workdir, "lib.vdi")
+        with open(self.lib_path, "wb") as handle:
+            handle.truncate(1024)
+        return HDDS_OUTPUT + f"""
+UUID:           eeeeeeee-5555-5555-5555-555555555555
+Parent UUID:    base
+State:          created
+Type:           normal (base)
+Location:       {self.lib_path}
+Storage format: VDI
+Capacity:       64 MBytes
+Size on disk:   1 MBytes
+"""
+
+    def _probes(self):
+        return [c for c in self.calls_log() if c.startswith("showmediuminfo")]
+
+    def test_an_unchanged_library_file_is_not_re_opened_every_refresh(self):
+        add_library_path("disk", self.lib_path)
+        w = self.make_window()
+        first = len(self._probes())
+        self.assertTrue(first, "the first refresh must open the library entry")
+        self.assertIn(self.lib_path, [r.location for r in w.media["disk"]])
+
+        w.refresh_media()
+        self.assertTrue(wait_until(lambda: not w._refreshing))
+        self.assertEqual(len(self._probes()), first,
+                         "an unchanged file was re-opened")
+
+    def test_a_changed_file_is_opened_again(self):
+        add_library_path("disk", self.lib_path)
+        w = self.make_window()
+        before = len(self._probes())
+
+        with open(self.lib_path, "wb") as handle:
+            handle.truncate(4096)
+        w.refresh_media()
+        self.assertTrue(wait_until(lambda: not w._refreshing))
+        self.assertGreater(len(self._probes()), before)
+
+    def test_an_entry_the_listing_does_not_show_is_opened_again(self):
+        # What a VBoxSVC restart looks like: the file is unchanged but the
+        # registration is gone, so skipping it would lose the row for good.
+        # This one is deliberately absent from the listing the fake prints.
+        forgotten = os.path.join(self.workdir, "forgotten.vdi")
+        with open(forgotten, "wb") as handle:
+            handle.truncate(1024)
+        add_library_path("disk", forgotten)
+        w = self.make_window()
+        before = len(self._probes())
+        self.assertNotIn(forgotten, [r.location for r in w.media["disk"]])
+
+        w.refresh_media()
+        self.assertTrue(wait_until(lambda: not w._refreshing))
+        self.assertGreater(len(self._probes()), before,
+                           "a forgotten registration was never re-opened")
+
+
+class DriftDetectionTest(FakeVBoxManageTest):
+    def test_a_change_with_no_command_of_ours_is_reported(self):
+        w = self.make_window()
+        w.runner.output.clear()
+        # Something else edited the registry between refreshes.
+        w.media["disk"] = w.media["disk"][:-1]
+        w._expect_change = False
+        w._check_drift()
+        self.assertIn("[registry] changed since the last refresh",
+                      w.runner.output.toPlainText())
+
+    def test_our_own_command_is_not_reported_as_drift(self):
+        w = self.make_window()
+        w.runner.output.clear()
+        w.media["disk"] = w.media["disk"][:-1]
+        w._expect_change = True
+        w._check_drift()
+        self.assertNotIn("[registry] changed", w.runner.output.toPlainText())
+
+    def test_an_unchanged_registry_says_nothing(self):
+        w = self.make_window()
+        w.runner.output.clear()
+        w._expect_change = False
+        w._check_drift()
+        self.assertNotIn("[registry] changed", w.runner.output.toPlainText())
+
+
+class DetailsPaneTest(FakeVBoxManageTest):
+    def test_the_pane_follows_the_selection_and_runs_nothing(self):
+        w = self.make_window()
+        w.tabs.setCurrentIndex(KINDS.index("disk"))
+        pane = w.panes["disk"]
+        before = len(self.calls_log())
+        w.act_details.setChecked(True)
+        pane.select_uuid("cccccccc-3333-3333-3333-333333333333")
+        pane.refresh_details()
+
+        rows = {pane.details.topLevelItem(i).text(0): pane.details.topLevelItem(i).text(1)
+                for i in range(pane.details.topLevelItemCount())}
+        self.assertEqual(rows["Name"], "other.vmdk")
+        self.assertEqual(rows["UUID"], "cccccccc-3333-3333-3333-333333333333")
+        self.assertEqual(len(self.calls_log()), before,
+                         "the details pane ran a command")
+
+    def test_the_toggle_is_remembered(self):
+        w = self.make_window()
+        w.act_details.setChecked(True)
+        self.assertTrue(get_settings().value("ui/details", False, bool))
+        w.act_details.setChecked(False)
+        self.assertFalse(get_settings().value("ui/details", False, bool))
+
+
+class StructuredFilterWindowTest(FakeVBoxManageTest):
+    def _visible(self, w):
+        pane = w.panes["disk"]
+        return sorted(i.text(COL_NAME) for i in pane._iter_items()
+                      if not i.isHidden())
+
+    def test_a_field_term_narrows_the_listing(self):
+        w = self.make_window()
+        w.tabs.setCurrentIndex(KINDS.index("disk"))
+        w.filter_edit.setText("fmt:vmdk")
+        self.assertEqual(self._visible(w), ["other.vmdk"])
+
+    def test_a_size_comparison_narrows_the_listing(self):
+        w = self.make_window()
+        w.filter_edit.setText("capacity:>5G")
+        # base.vdi is 10 GB and keeps child.vdi visible as its child.
+        self.assertIn("base.vdi", self._visible(w))
+        self.assertNotIn("other.vmdk", self._visible(w))
+
+    def test_a_plain_word_still_works(self):
+        w = self.make_window()
+        w.filter_edit.setText("other")
+        self.assertEqual(self._visible(w), ["other.vmdk"])
+
+    def test_clearing_the_filter_shows_everything_again(self):
+        w = self.make_window()
+        w.filter_edit.setText("fmt:vmdk")
+        w.filter_edit.setText("")
+        self.assertEqual(len(self._visible(w)), 4)
 
 
 if __name__ == "__main__":

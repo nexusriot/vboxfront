@@ -1,9 +1,151 @@
-vboxfront (1.7.0) UNRELEASED; urgency=medium
+vboxfront (1.9.0) unstable; urgency=medium
 
-  * Development version; no changes yet. Change the distribution to
-    "unstable" once this release has something in it.
+  * Import a compressed raw image without unpacking it first
+    (`convertfromraw stdin`). A 40 GB .img.gz no longer has to be extracted
+    to a 40 GB temp file: the archive is decompressed straight into
+    VBoxManage's standard input and no unpacked copy is ever written. gzip,
+    bzip2 and xz, all from the standard library. The byte count the command
+    needs is mandatory and is the uncompressed length — gzip records one
+    below 4 GiB and it is filled in automatically; the others are measured by
+    one streaming pass over the (smaller) archive, which the dialog does on
+    request and shows progress for.
+  * Export to a flat raw image (`clonemedium --format RAW`). RAW never
+    appears in a format combo, because its backend registers no hard-disk
+    extension and so can never be a managed medium — but it is a perfectly
+    good clone target, and this was the one direction the app could not go.
+    The result is what feeds dd, a USB stick or qemu.
+  * Media health can now clean up after itself: one guided pass unregisters
+    every entry whose backing file is gone, which is the commonest way a
+    registry rots. Plain closemedium, never --delete — there is no file left
+    to delete.
+  * Media health reports disks attached without --discard, which is why
+    compacting them so often reclaims nothing: without it the guest's TRIM
+    never reaches the image. The attach dialog has always offered the flag
+    and nothing ever reported its absence.
+  * A medium held only by a snapshot is now explained rather than failing
+    obscurely. storageattach edits a VM's current state only, so there is no
+    slot to clear; Detach used to answer "could not locate the attachment
+    slot", which read like a bug in the app.
+  * The orphan scan can say why an image is unregistered. Usually its UUID
+    collides with one already registered — a copied .vdi — and the fix is
+    Image UUID tools, which the app has shipped since 1.2.0 with nothing
+    pointing at it.
+  * Attach and Properties take a selection, as compact, remove, detach and
+    convert have since 1.6.0. Attach fills consecutive free slots, stepping
+    over occupied ones rather than letting storageattach replace them
+    silently; Properties shows what a selection has in common and sends only
+    what was changed — an empty description box never blanks differing ones.
+  * A visible queue. A batch of thirty compacts was one number in the status
+    bar; it now lists what is still waiting, with "Skip the rest", which
+    drops the queue and leaves the running command alone.
+  * Plan mode (File → Plan mode): every batch shows the exact commands it
+    would run, with Copy as script and Save as…, and runs only if you say so
+    there. Portable to a machine with no GUI, or into a change ticket.
+  * Command history can be saved as a shell script — the selected commands,
+    or all of them. A command whose password went over stdin is flagged in
+    the file rather than left to fail at three in the morning.
+  * A registry snapshot is written automatically before a batch remove, a
+    batch convert or a health cleanup. It cannot undo anything — the trash
+    does that for files — but it records every UUID and location as they were.
+  * A details pane (Media → Details pane, Ctrl+J) for the selected medium.
+    Everything in it is already in the listing on screen, so opening it runs
+    nothing; Info shells out and prints into the output panel, which had made
+    the panel a viewer.
+  * A structured filter: `fmt:vdi`, `size:>10G`, `capacity:<2T`, `vm:alpha`,
+    `state:inaccessible` and the rest, alongside the plain substring match.
+    A term that names no field — a pasted Windows path, say — stays a plain
+    word.
+  * Elapsed time and an estimate on the progress bar, and a window alert plus
+    a one-line verdict when something that ran over thirty seconds finishes.
+    Nothing is guessed below 5% or in the first seconds, where the number
+    would swing more than it would help.
+  * The registry is fingerprinted on every refresh, and a change that no
+    command of ours explains is reported. The VirtualBox GUI, a VM starting
+    or a second copy of this app can all edit it, and a stale row is how an
+    action lands on the wrong medium.
+  * Refreshes are much cheaper on a large library: a library entry whose file
+    has not changed since it was last opened is no longer re-opened, which
+    was one process per entry on every F5. An entry the listing stops showing
+    — what a VBoxSVC restart looks like — is always opened again.
+  * A default folder for new images, in Settings, falling back to
+    VirtualBox's own default machine folder instead of the home directory.
+    Each dialog then remembers the folder it was last used in.
+  * Colours come from the palette rather than being hardcoded, so the greys
+    and the inline warnings stay readable on a dark theme.
+  * A column chooser on the list header (eleven columns is a horizontal
+    scroll on a laptop), and shortcuts for compact, resize, convert, attach,
+    detach, properties, health, history and undo delete.
+  * Resizing a disk with differencing children is refused with the child
+    named, the guard Format as FAT already had.
 
- -- Vlad Ananyev <vlananyev@gmail.com>  Sat, 06 Sep 2026 00:00:00 +0000
+ -- Vlad Ananyev <vlananyev@gmail.com>  Sat, 18 Oct 2026 00:00:00 +0000
+
+vboxfront (1.8.0) unstable; urgency=medium
+
+  * Deleting a disk image is now undoable. Remove's delete action no longer
+    passes --delete to closemedium, which unlinks the file for good: the
+    medium is unregistered and VBoxFront moves the backing file into a trash
+    folder itself — by default a hidden .vboxfront-trash/ beside the image,
+    so the move is a rename inside one filesystem and costs nothing however
+    large the disk is. Media → Undo delete puts the last delete back for the
+    rest of the session, a batch remove as one batch, library entry included.
+    The trash folder can be moved, or the whole thing turned off (back to a
+    real --delete), in File → Settings. Nothing is ever emptied
+    automatically, a name already taken in the trash is suffixed rather than
+    overwritten, and an undo refuses to write over a file that has reappeared
+    at the original path.
+
+ -- Vlad Ananyev <vlananyev@gmail.com>  Sat, 18 Oct 2026 00:00:00 +0000
+
+vboxfront (1.7.0) unstable; urgency=medium
+
+  * Fix a medium being dropped from the listing and replaced by a phantom
+    row. VBoxManage prints description continuations flush left, so a
+    description holding a blank line followed by a "UUID:" line looked
+    exactly like the start of the next record: the real medium never reached
+    its Location and was discarded, while the phantom that took its place
+    carried a UUID with a newline embedded in it — which then went into
+    whatever command was run on that row. A "UUID:" inside a description now
+    only opens a record once the one being read has a Location, which is the
+    point at which VBoxManage could have finished printing it.
+  * Fix media vanishing from the tree when a Parent UUID loops. An image
+    whose parent is itself — which `sethdparentuuid` will happily stamp — or
+    a pair that name each other were both left with no root to hang from, so
+    nothing drew them while the totals line went on counting them. An image
+    that is not on screen cannot be selected, inspected or repaired. Every
+    medium now gets a row whatever the chain says.
+  * Fix a batch convert destroying a disk it was about to convert. The
+    existing targets are all deleted before the queue starts (clonemedium
+    refuses a target that is already there), so a plan that aimed one disk's
+    clone at another's backing file destroyed that disk before its own turn
+    came round. Re-running a convert over a folder that already held its
+    output did exactly that, with the default suffix. Refused outright now.
+  * Convert and batch convert name the registered medium a target belongs to
+    before overwriting it. Saying yes to "Overwrite?" also deletes whatever
+    VirtualBox has registered at that path, leaving a registry entry pointing
+    at a file that is no longer the medium it names; that is now a decision
+    rather than a surprise.
+  * `clonemedium --existing` and `mediumio cat --output=` now count as
+    destructive when re-run from the history, so they need the word RUN typed
+    like any other command that overwrites something. `--existing` is the one
+    clone mode that writes into an image that is already there, and mediumio
+    overwrites its output file without asking.
+  * Resize says why a disk with differencing children cannot grow, naming the
+    child, instead of passing VirtualBox's read-only error along — the same
+    guard Format as FAT already had.
+  * Exporting to a name ending in .csv or .json writes that format, whatever
+    the filter combo happened to be showing. Picking the JSON filter and
+    typing "report.csv" used to write JSON into a .csv file.
+  * Quitting while a command is running now removes its password files.
+    QProcess.finished is what normally triggers the shred and it never
+    arrives when the process is killed on the way out.
+  * New hermetic end-to-end suite (`make e2e`): the real application driven
+    against a stateful fake VBoxManage inside a container — a registry that
+    persists, real image files, real process launches — so a workflow can be
+    checked by what it changed rather than by what it printed. 40 scenarios,
+    no VirtualBox, no display and no network. Also runs in CI.
+
+ -- Vlad Ananyev <vlananyev@gmail.com>  Sat, 18 Oct 2026 00:00:00 +0000
 
 vboxfront (1.6.0) unstable; urgency=medium
 

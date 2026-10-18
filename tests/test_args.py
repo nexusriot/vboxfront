@@ -1,7 +1,11 @@
 """Command argv builders, and the version the build scripts read."""
 
+import bz2
+import gzip
+import lzma
 import os
 import pathlib
+import struct
 import sys
 import tempfile
 import unittest
@@ -9,6 +13,12 @@ import unittest
 from vboxfront import (
     APP_VERSION,
     PASSWORD_STDIN,
+    compressor_for,
+    convertfromraw_stdin_args,
+    export_raw_args,
+    measure_uncompressed,
+    open_maybe_compressed,
+    uncompressed_size,
     clone_args,
     is_destructive_command,
     mediumproperty_args,
@@ -351,6 +361,94 @@ class RerunSafetyTest(unittest.TestCase):
     def test_rerun_rejects_junk(self):
         self.assertIsNone(rerun_args(""))
         self.assertIsNone(rerun_args("'unbalanced"))
+
+
+class CompressedImportTest(unittest.TestCase):
+    """`convertfromraw stdin` and the byte count it demands."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="vboxfront-compressed-")
+        self.raw = os.path.join(self.dir, "disk.img")
+        with open(self.raw, "wb") as handle:
+            handle.write(b"\xa5" * 3_000_000)
+
+    def _compress(self, suffix, opener):
+        target = self.raw + suffix
+        with open(self.raw, "rb") as src, opener(target, "wb") as dst:
+            dst.write(src.read())
+        return target
+
+    def test_args_carry_the_byte_count_and_format(self):
+        self.assertEqual(
+            convertfromraw_stdin_args("/images/out.vdi", 3_000_000, "VDI"),
+            ["convertfromraw", "stdin", "/images/out.vdi", "3000000",
+             "--format=VDI"],
+        )
+
+    def test_a_standard_variant_is_left_off(self):
+        args = convertfromraw_stdin_args("/images/out.vdi", 10, "VDI", "Standard")
+        self.assertNotIn("--variant=Standard", args)
+        self.assertIn(
+            "--variant=Fixed",
+            convertfromraw_stdin_args("/images/out.vdi", 10, "VDI", "Fixed"),
+        )
+
+    def test_gzip_size_comes_from_the_trailer_without_reading_it(self):
+        archive = self._compress(".gz", gzip.open)
+        self.assertEqual(uncompressed_size(archive), 3_000_000)
+
+    def test_a_wrapped_gzip_trailer_is_refused_rather_than_believed(self):
+        # ISIZE is the length modulo 2^32, so it is wrong above 4 GiB. A value
+        # below the compressed size cannot be right, which is the case worth
+        # catching: believing it would truncate the imported image.
+        archive = self._compress(".gz", gzip.open)
+        with open(archive, "r+b") as handle:
+            handle.seek(-4, os.SEEK_END)
+            handle.write(struct.pack("<I", 1))
+        self.assertIsNone(uncompressed_size(archive))
+
+    def test_bzip2_and_xz_have_to_be_measured(self):
+        for suffix, opener in ((".bz2", bz2.open), (".xz", lzma.open)):
+            archive = self._compress(suffix, opener)
+            self.assertIsNone(uncompressed_size(archive), suffix)
+            self.assertEqual(measure_uncompressed(archive), 3_000_000, suffix)
+
+    def test_measuring_reads_the_compressed_file_not_the_image(self):
+        archive = self._compress(".xz", lzma.open)
+        self.assertLess(os.path.getsize(archive), 3_000_000)
+        self.assertEqual(measure_uncompressed(archive), 3_000_000)
+
+    def test_measuring_can_be_cancelled(self):
+        archive = self._compress(".bz2", bz2.open)
+        self.assertIsNone(measure_uncompressed(archive, lambda _total: False))
+
+    def test_an_uncompressed_file_reports_its_own_size(self):
+        self.assertEqual(uncompressed_size(self.raw), 3_000_000)
+        self.assertIsNone(compressor_for(self.raw))
+
+    def test_a_truncated_archive_measures_as_unknown(self):
+        archive = self._compress(".gz", gzip.open)
+        with open(archive, "r+b") as handle:
+            handle.truncate(os.path.getsize(archive) // 2)
+        self.assertIsNone(measure_uncompressed(archive))
+
+    def test_the_stream_decompresses_transparently(self):
+        archive = self._compress(".gz", gzip.open)
+        with open_maybe_compressed(archive) as stream:
+            self.assertEqual(stream.read(8), b"\xa5" * 8)
+
+
+class ExportRawTest(unittest.TestCase):
+    def test_raw_is_reachable_as_a_clone_target(self):
+        # RAW never appears in a format combo — disk_backends() drops it
+        # because its backend registers no HardDisk extension — but it is a
+        # perfectly good clonemedium target, and the only way out to a flat
+        # image.
+        self.assertEqual(
+            export_raw_args("7894924d-30ae-41ec-a640-98cdba451f17", "/out/flat.img"),
+            ["clonemedium", "disk", "7894924d-30ae-41ec-a640-98cdba451f17",
+             "/out/flat.img", "--format", "RAW"],
+        )
 
 
 if __name__ == "__main__":

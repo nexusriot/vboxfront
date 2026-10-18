@@ -15,7 +15,7 @@ shell.
 
 ## Layout
 
-Everything lives in `vboxfront.py` (~5k lines), deliberately single-file:
+Everything lives in `vboxfront.py` (~7.4k lines), deliberately single-file:
 the tool is small, PyInstaller onefile packaging stays trivial, and there is
 no import graph to maintain. The file is ordered so that the pure,
 Qt-independent layer comes first and is importable by tests without a
@@ -24,7 +24,7 @@ display:
 | Section | Contents |
 |---|---|
 | Constants | `KIND_META` (disk/dvd/floppy nouns, list categories, attach types, file filters), formats/variants/types/ciphers, column indices |
-| Pure helpers | `parse_media_list`, `parse_machinereadable`, `parse_vms_list`, `parse_in_use_snapshot`, `parse_host_drives`, `find_attachment`, `find_free_port`, `controller_types`/`max_device_index`, `parse_capacity_mb`, `format_mbytes`/`format_bytes`, `free_bytes_for`/`space_warning`, `records_to_csv`/`_json`/`_tsv`, `scan_for_images`, `health_findings`, `is_destructive_command`/`rerun_blocker`, arg builders (`create_disk_args`, `attach_args`, `clone_args`, `resize_args`, `mediumproperty_args`, `encrypt_args`, …), QSettings library accessors |
+| Pure helpers | `parse_media_list`, `parse_machinereadable`, `parse_vms_list`, `parse_in_use_snapshot`, `parse_host_drives`, `find_attachment`, `find_free_port`, `controller_types`/`max_device_index`, `parse_capacity_mb`, `format_mbytes`/`format_bytes`, `free_bytes_for`/`space_warning`, `same_file`/`registered_at`, `records_to_csv`/`_json`/`_tsv`, `scan_for_images`, `health_findings`, `is_destructive_command`/`rerun_blocker`, arg builders (`create_disk_args`, `attach_args`, `clone_args`, `resize_args`, `mediumproperty_args`, `encrypt_args`, …), QSettings library accessors |
 | Process runners | `CommandRunner` (visible, streaming), `CaptureRunner` (silent, buffered) |
 | Dialogs | `CreateDiskDialog`, `CreateDiffDialog`, `CreateFloppyDialog`, `ResizeDialog`, `ConvertDialog`, `BatchConvertDialog`, `ContentsDialog`, `RemoveDialog`, `ResolveDialog`, `UuidToolsDialog`, `PropertiesDialog`, `MediumPropertyDialog`, `HealthDialog`, `OrphanScanDialog`, `EncryptDialog`, `AttachDialog`, `SettingsDialog`, `CommandHistoryDialog` — all plain `QDialog` |
 | Views | `MediumItem` (numeric-sorting tree item), `MediaPane` (one tab: tree + populate/filter/selection) |
@@ -33,6 +33,10 @@ display:
 Command construction is centralised in the module-level `*_args` builders so
 tests can assert argv exactly and the UI code never assembles strings ad hoc.
 There is no shell anywhere — arguments are passed as lists to `QProcess`.
+
+Around the module sit `tests/` (unit, offscreen Qt) and `e2e/` (the
+containerised end-to-end suite and its stateful fake VBoxManage); neither is
+packaged into the binary.
 
 ## Process model
 
@@ -56,6 +60,15 @@ Two `QProcess` wrappers with different jobs:
     setting (VERR_INVALID_FUNCTION)"* without ever looking at the data.
     `readPasswordFile()` special-cases the name `stdin` and plain-reads the
     stream instead — see `PASSWORD_STDIN`.
+  - **A streamed stdin** for `convertfromraw stdin`, which reads a whole
+    image off standard input. `stdin_data` is one buffer in memory and will
+    not do for 40 GB, so `run(..., stdin_stream=…)` takes a file object and
+    feeds the child a megabyte at a time, driven by `bytesWritten` — the next
+    chunk only goes in once the last has drained, so the event loop keeps
+    turning and the window stays usable throughout. With `stdin_total` the
+    bytes written drive a real percentage instead of waiting for the child to
+    print one. The stream is closed on every exit path, failed start
+    included.
   - **stdin is always closed** once the payload (if any) is written. Leaving
     it open hung any command that tried to read it, with only Cancel to get
     out — which is exactly what the test fake did.
@@ -248,7 +261,16 @@ VBoxFront therefore keeps its own **media library** — per-kind path lists in
   everything else continues the current value — blank lines included, so the
   one separating two records is stripped off again when the record is built.
   Unknown labels are continuations too, which keeps warnings merged in from
-  stderr from eating the record that follows them. **That cuts both ways:** a
+  stderr from eating the record that follows them. **The two halves of that
+  trap meet** when a description holds a blank line *and* the line after it
+  reads `UUID: …`: the blank line is the record separator, so the parser
+  believed it, and the real medium — which had not reached its `Location:`
+  yet — was discarded while the phantom that replaced it carried a UUID with
+  a newline embedded in it, straight into the next command run on that row.
+  A `UUID:` inside a description therefore opens a record only once the one
+  being read already has a `Location`, which is the point at which VBoxManage
+  could have finished printing it; before that it is description text, not a
+  record. **That cuts both ways:** a
   real field left out of `MEDIUM_KEYS` silently becomes part of the previous
   value. It happened with `Access Error:`, which VBoxManage prints (with an
   unindented `VD: error …` continuation) for a medium it cannot open — folded
@@ -279,6 +301,96 @@ VBoxFront therefore keeps its own **media library** — per-kind path lists in
   responses are discarded via a request counter), which also makes the
   dialog fully testable with a canned callback.
 
+## Reach beyond the obvious subcommands
+
+Two things VBoxManage can do that no combo box ever offered:
+
+- **`convertfromraw stdin <target> <bytes>`** imports an image off standard
+  input, so a compressed archive can be decompressed straight into it and
+  never exists unpacked. The catch is the byte count: it is mandatory, it is
+  the *uncompressed* length, and it is how the backend sizes the target
+  before a sector arrives. gzip records one in its trailer — but **modulo
+  2^32**, so it is exact below 4 GiB and silently wrong above it;
+  `gzip_uncompressed_size()` rejects a value smaller than the compressed file,
+  which catches the wrapped cases worth catching. bzip2 and xz record nothing
+  usable, so those are **measured**: one streaming pass over the archive,
+  counting and writing nothing, offered as a button rather than done
+  automatically because it is real work. Getting it wrong is not subtle — too
+  small truncates the image, too large fails part-way — which is why the
+  dialog never guesses.
+- **`clonemedium --format RAW`** writes a flat image. RAW is absent from every
+  format combo because `disk_backends()` drops it: its backend registers no
+  HardDisk extension, so it can never be a *managed* medium. That is a sound
+  reason to keep it out of Create and Convert and a bad reason to have no way
+  out at all — Import RAW had existed since 1.1.0 with no counterpart. Export
+  is therefore its own action, bypassing the backend list, and says plainly
+  that a raw image is flat: the whole capacity, whatever the source has
+  allocated.
+
+## Batches
+
+- The queue is **visible**: `CommandRunner.show_queue()` lists what is still
+  waiting, and **Skip the rest** drops the queue while leaving the running
+  command alone (Cancel is what stops that one). Thirty compacts used to be a
+  single number in the status bar.
+- **Plan mode** routes every `_run_queue` through `PlanDialog` first: the
+  commands as a quoted shell script, with Copy and Save, and nothing runs
+  unless the user says so there. It fits the ethos better than anything else
+  in the app — every action is already a visible VBoxManage command, and this
+  makes the list portable. Batch convert is careful to delete no overwrite
+  target while only a plan is being shown.
+- **Registry snapshots** (`write_registry_snapshot`) are written before a
+  batch remove, a batch convert and a health cleanup, into
+  `~/.local/share/vboxfront/snapshots/`. They undo nothing — the trash does
+  that for files — but they record every UUID and location as they were,
+  which is what a rebuild needs. A snapshot that cannot be written is noted
+  and the operation goes ahead: refusing to delete a medium because a log
+  file failed would be the worse behaviour.
+- **Multi-select Attach** allocates slots with `free_slots()`, which steps
+  over occupied ones rather than replacing them. `storageattach` replaces an
+  occupied slot silently, and a batch is exactly where nobody is watching
+  each command go by; too few free slots is refused outright rather than
+  quietly attaching some of the selection.
+- **Multi-select Properties** sends only what was changed. The dangerous
+  default is a batch stamping the first medium's description onto the rest,
+  so a selection that disagrees shows an empty box with a placeholder saying
+  so, and an empty box means "leave each one alone".
+
+## Checks that need a command
+
+`health_findings()` is a pure function over the parsed registry, which is why
+the health dialog costs nothing to open. Two things do not fit that shape and
+are therefore opt-in buttons:
+
+- **Clean up…** unregisters every entry whose backing file is gone — the
+  commonest way a registry rots, and until 1.9.0 the dialog could only point
+  at it. Plain `closemedium`, never `--delete`: there is no file left to
+  delete, and asking for one would only fail.
+- **Check attach flags** needs a `showvminfo` per VM, because whether a slot
+  passes the guest's TRIM through lives there and not in `list -l`.
+  `discard_findings()` reports every disk attached with `--discard` off,
+  which is the usual reason a compact reclaims nothing: without it the
+  guest's TRIM never reaches the image, so blocks freed inside the guest stay
+  allocated forever.
+
+Findings carry a `code` as well as prose, so the fixes key off the code —
+matching on the wording would break the moment it changed.
+
+**Snapshot-only media** get their own finding, and their own message in
+Detach. `storageattach` edits a VM's *current* state, so a medium held only
+by a snapshot has no slot to clear; the old behaviour was "could not locate
+the attachment slot", which reads like a bug in the app rather than a fact
+about VirtualBox. `snapshot_only()` keys off the trailing `[snap (UUID: …)]`
+the listing already carries.
+
+**Why an image is unregistered** is a question only VirtualBox can answer, so
+the orphan scan asks it: `showmediuminfo <path>` on each candidate, and
+`parse_uuid_collision()` on the refusal. The usual answer is a UUID that is
+already taken — a copied `.vdi` — and the fix is *Image UUID tools*, which
+the app had shipped since 1.2.0 with nothing pointing at it. A colliding
+candidate is unticked, because adopting it would only produce a failing
+re-open on every refresh.
+
 ## UI model
 
 - Three `MediaPane` tabs (hard disks / DVDs / floppies). Disk-only actions
@@ -298,8 +410,17 @@ VBoxFront therefore keeps its own **media library** — per-kind path lists in
   listing, so nothing extra is run for it — the match is anchored on the
   trailing `(UUID: …)]` because a snapshot name can itself contain brackets.
 - The disk tree nests **differencing images** under their parents
-  (`Parent UUID` chains; unknown parents fall back to top level, cycles are
-  guarded). DVDs/floppies render flat.
+  (`Parent UUID` chains; unknown parents fall back to top level).
+  DVDs/floppies render flat. **Trap:** guarding the *recursion* against a
+  cycle is not the same as drawing one. A medium whose parent is itself —
+  which `sethdparentuuid` will stamp without complaint — or a pair that name
+  each other were both counted as children, so neither reached the root list
+  and nothing ever drew them: the rows simply disappeared while the totals
+  line went on counting them, and an image that is not on screen cannot be
+  selected, inspected or repaired. A self-parent is now ignored when roots
+  are picked, and a final pass gives a row to anything the walk did not
+  reach, so the invariant is "every record gets exactly one row", whatever
+  the chain claims.
 - The **Encryption** column shows the cipher of an encrypted medium (or
   `enabled` when the cipher is unknown) and nothing at all otherwise —
   `disabled` on every row is noise; the tooltip carries the password ID.
@@ -400,8 +521,41 @@ hidden by a filter set days ago looks like missing media.
 - No shell: argv lists only, `shlex.quote` used solely for *display*.
 - Encryption passwords travel via stdin, never argv (see above); the echoed
   command line shows the literal `stdin` placeholder.
-- The Remove dialog defaults to keep-file; `--delete` requires a second
-  explicit confirmation.
+- The Remove dialog defaults to keep-file; deleting the file requires a
+  second explicit confirmation.
+- **Deleting a file is a move, not an unlink.** `closemedium --delete` is
+  never sent while the trash is on (the default): the medium is unregistered
+  with a plain `closemedium`, and the backing file is then renamed into a
+  trash folder by the app itself — `os.replace`, falling back to
+  `shutil.move` across filesystems. The default trash is a hidden
+  `.vboxfront-trash/` beside the image, which keeps that rename inside one
+  filesystem: instant for a 200 GB disk, where a copy is not. An image whose
+  own folder cannot be written falls back to `$XDG_DATA_HOME/vboxfront/trash`,
+  accepting a slow copy over refusing to delete. This is the whole point of
+  the feature: guards make a mistake less likely, only a trash makes one
+  survivable, and a rename costs nothing.
+  - The move happens in the per-command follow-up, so it runs **only after
+    that medium's `closemedium` has exited 0**. Before the command VirtualBox
+    still holds the medium; after a failure the medium is still registered,
+    and a file moved out from under it would be a second fault on top of the
+    first.
+  - *Media → Undo delete* restores the newest batch — one `Remove` is one
+    mistake, so a remove of five disks puts all five back — and re-adds each
+    path with `add_library_path`, because the medium was unregistered and the
+    library entry is what re-opens it on the next refresh. The stack is
+    session-only: the files outlive the app, but the app never claims it can
+    undo a delete whose original paths it has forgotten.
+  - Two refusals keep the undo from becoming the thing it protects against: a
+    name already taken in the trash is suffixed rather than overwritten (two
+    `disk.vdi` from different folders land together), and a restore whose
+    original path is occupied again fails loudly and leaves the file in the
+    trash rather than writing over whatever is there now.
+  - Trash folders are skipped by the orphan scan — offering to adopt an image
+    the user has just deleted is the opposite of what that scan is for.
+  - Turning the trash off in Settings sends a real `--delete` again, and the
+    confirmation says "permanently" instead of naming a destination. The
+    dialog reads the setting once, at construction: the promise the
+    confirmation makes has to be the one the removal keeps.
 - `clonemedium` and `convertfromraw` fail with `VERR_ALREADY_EXISTS` rather
   than overwriting, so a confirmed overwrite target has to be deleted first.
   That happens in `MainWindow._clear_target`, immediately before the command
@@ -409,12 +563,32 @@ hidden by a filter set days ago looks like missing media.
   leave the file destroyed and nothing written in its place. Both dialogs also
   refuse a target that `same_file()` resolves to the source, which otherwise
   deleted the very disk being converted.
+- **A clone target is checked against the whole registry, not just its own
+  source.** Two ways that bit. In a batch, *every* existing target is deleted
+  before the queue starts, so aiming one disk's clone at another selected
+  disk's backing file destroyed that disk before its own turn came round —
+  which re-running a convert over a folder already holding its output did,
+  with the default suffix. That is refused outright. And a target that is any
+  other registered medium's file is named (basename and UUID) in a warning
+  that defaults to No, because saying yes to a bare "Overwrite?" also leaves
+  VirtualBox's registry entry pointing at a file that is no longer the medium
+  it names. `registered_at()` does the lookup through `same_file()`, so a
+  symlinked path still matches.
+- **The history's re-run guard asks whether a replay would overwrite
+  anything**, not whether the verb looks dangerous. `--existing` is on the
+  destructive list because it is the one `clonemedium` mode that writes into
+  an image that is already there (every other one refuses an existing target,
+  so a replay can only fail), and any `--output=<file>` is too, because
+  `mediumio` overwrites it silently — the dialog confirms that the first time
+  round and a replay would skip the question. `--output=-` is stdout and does
+  not count.
 
 ## Testing
 
 `make test` → stdlib `unittest`, offscreen (`QT_QPA_PLATFORM=offscreen`),
 no display, no VirtualBox needed. `tests/__init__.py` points
-`XDG_CONFIG_HOME` at a temp dir so QSettings never touch the real config.
+`XDG_CONFIG_HOME` at a temp dir so QSettings never touch the real config, and
+`XDG_DATA_HOME` with it — the delete trash falls back there.
 
 - `test_parsing.py` — parsers against **real captured 7.2.12 output**
   (including the continuation-line and `-nonrotational-` traps).
@@ -427,7 +601,50 @@ no display, no VirtualBox needed. `tests/__init__.py` points
   follow-ups, batch remove guards, library re-open calls, selection restore,
   drops, export, health and orphan flows. The fixture lives in
   `FakeVBoxManageTest`, which the suites inherit — subclassing a class that
-  *has* tests re-runs all of them once per suite.
+  *has* tests re-runs all of them once per suite. Its `hdds_output()` is a
+  hook rather than a constant, so the delete-trash suite can list images it
+  really put on disk and then assert on the files themselves.
+
+`make e2e` → the hermetic **end-to-end** suite in Docker (`e2e/`), or
+`make e2e-local` against the host Python. Where the unit suite proves each
+command is *built* right, this one proves the workflows built out of them
+*work*: the real `MainWindow`, real `QProcess` launches, real files — only
+VBoxManage is replaced.
+
+- `e2e/fake_vboxmanage.py` is a **stateful** stand-in, not a canned-output
+  script: a JSON registry plus real (sparse) image files, so a create is
+  visible to the next list, a clone leaves a second file, a resize moves the
+  number the listing reports, `closemedium --delete` really unlinks (which
+  is what the trash-off scenario checks is no longer sent by default), and
+  `encryptmedium` really reads the secret off stdin and checks it later. It
+  implements only what the app invokes and exits 1 on anything else, so a
+  command the app starts sending without a handler behind it fails loudly
+  rather than passing silently. It also keeps each medium's UUID **inside**
+  its image file, as VirtualBox does, which is what makes a copied `.vdi`
+  refuse to register alongside its original — the scenario the orphan scan's
+  collision message exists for. An earlier version guessed at that by
+  comparing file contents, and declared two blank images of the same size
+  copies of each other.
+- `e2e/test_e2e.py` drives 63 scenarios across create/remove (delete into the
+  trash, undo as a batch and newest-first, a DVD coming back to its own shelf,
+  a failed unregister that must not move anything, and the real `--delete`
+  once the trash is turned off through the Settings dialog itself),
+  resize and compact (asserting the reclaim line against the real `st_blocks` delta),
+  clone and batch clone, attach/detach round trips, differencing chains,
+  the encryption round trip and the two-file re-key, the media library across
+  a simulated VBoxSVC restart, import RAW, health and resolve, `mediumio`
+  extraction, properties, move, queue abort, history, and export. Three are
+  named regressions for the defects fixed in 1.7.0.
+- Hermetic by construction: `--network none`, no VirtualBox, no display, no
+  state outside a per-test temporary directory. The container runs both
+  suites, and CI runs the container.
+
+Driving modal dialogs needs `QDialog.exec` stubbed for the whole turn of the
+event loop, not just the call: Attach reads `list vms` first and builds its
+dialog in the callback, so a patch that ended with the action let the real
+modal `exec()` through and hung the suite. For the same reason "settled"
+has to include the in-flight `CaptureRunner` children — the runner can look
+idle while a detach has not started yet.
 
 Two Qt traps the suite has already paid for: `QDropEvent` does not take
 ownership of its `QMimeData`, so a locally-built one is collected while the
@@ -436,10 +653,13 @@ event still points at it (a segfault, not a failure); and patching a dialog's
 them per instance and shadows the patched class attribute — the tests swap the
 whole dialog class for a stub instead.
 
-CI (`.github/workflows/ci.yml`) runs the suite and builds the `.deb`
-artifact on every push. A manual end-to-end pass against a real VirtualBox
-(create → list → remove) was verified on 7.2.12; it is not part of CI since
-runners have no VirtualBox.
+CI (`.github/workflows/ci.yml`) runs the unit suite, then the containerised
+end-to-end suite, then builds the `.deb` artifact, on every push. A manual
+pass against a **real** VirtualBox (create → list → remove) was verified on
+7.2.12; that stays manual, since runners have no VirtualBox — which is the
+gap `e2e/` narrows rather than closes. The fake is faithful to the output
+shapes captured from 7.2.12, but it is still a fake: it cannot catch
+VBoxManage changing its mind about them.
 
 ## Packaging
 
@@ -461,9 +681,17 @@ cross-compile — binaries are host-arch only.
 | Limitation | Why / workaround |
 |---|---|
 | One VBoxManage command at a time | Serialised by design for transparency; batches queue sequentially |
-| Change encryption password needs two steps | Two stdin secrets in one `encryptmedium` call is untested territory — decrypt, then encrypt |
+| Changing an encryption password spills two secrets to disk | Two stdin secrets in one `encryptmedium` call do not work (the first read swallows the buffer), so the re-key writes two 0600 temp files and shreds them when the command exits — including on the way out of the app |
 | Library entries are paths, not UUIDs | A moved-outside-the-app file shows as a `[library] could not open` note; prune in Settings |
-| `list -l` refresh cost | One process per library entry + 3 list calls; fine for typical registries |
+| `list -l` refresh cost | 3 list calls, plus one process per library entry *that changed*: an entry whose file has the same mtime and size as when it was last opened is skipped. An entry the listing stops showing — a VBoxSVC restart — is always re-opened, so the cache can never lose a row |
 | Create-time medium properties | `mediumproperty set` exits 0 and changes nothing for a property the backend only reads at creation (VDI's `AllocationBlockSize`); the dialog says so |
 | `repairhd -dry-run` sign-off | Prints "Corrupted VDI image repaired successfully" whatever it found, having written nothing; the verdict is the line above it |
 | Free-space estimates | A guess: they cannot know about compression, reflinks or a quota about to change, so they warn and never refuse |
+| A resize or format needs a childless medium | A parent is read-only to VirtualBox; both actions name the child and stop rather than passing `VERR_VD_IMAGE_READ_ONLY` along |
+| The delete trash is never emptied | Deliberate: an automatic purge is another unattended delete. Files sit in `.vboxfront-trash/` (or the configured folder) until removed by hand |
+| Undo delete does not survive a restart | The trashed files do, but the original paths live only in the session's undo stack; after a restart they are ordinary files to move back by hand |
+| A trashed file still occupies its disk | A rename frees nothing: the space comes back only when the trash folder is cleared |
+| An ETA is linear extrapolation | From the only signal there is, the percentage VBoxManage prints; a clone is not uniform work, so it is prefixed "~" and nothing is shown below 5% or in the first seconds |
+| Drift is reported, not resolved | A registry change no command of ours explains is noted after the refresh that found it; the listing shown is always the current one |
+| Compressed import is gzip/bzip2/xz | All three are standard library, so nothing has to be installed. zstd and lz4 would need an external binary, and a missing one is a worse failure than not offering the format |
+| The end-to-end suite talks to a fake | Faithful to 7.2.12's output shapes, but it cannot notice VBoxManage changing them; the real-VirtualBox pass stays manual |
