@@ -42,6 +42,7 @@ from PyQt6.QtWidgets import (  # noqa: E402
 )
 
 import vboxfront  # noqa: E402
+import vboxfront_app.media_dialogs as media_dialogs_module
 from e2e import fake_vboxmanage  # noqa: E402
 from vboxfront import (  # noqa: E402
     COL_CAPACITY,
@@ -82,6 +83,9 @@ class E2ECase(unittest.TestCase):
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="vboxfront-e2e-")
+        data_env = mock.patch.dict(os.environ, {"XDG_DATA_HOME": os.path.join(self.dir, "data")})
+        data_env.start()
+        self.addCleanup(data_env.stop)
         self.images = os.path.join(self.dir, "images")
         os.makedirs(self.images)
         self.state_path = os.path.join(self.dir, "state.json")
@@ -104,6 +108,7 @@ class E2ECase(unittest.TestCase):
 
         get_settings().setValue("vboxmanage_path", self.fake)
         get_settings().remove("history")
+        get_settings().remove("trash/batches")
         get_settings().remove("trash/enabled")
         get_settings().remove("trash/dir")
         for kind in KINDS:
@@ -122,6 +127,7 @@ class E2ECase(unittest.TestCase):
             self.window = None
         QApplication.processEvents()
         get_settings().setValue("vboxmanage_path", "")
+        get_settings().remove("trash/batches")
         get_settings().remove("trash/enabled")
         get_settings().remove("trash/dir")
 
@@ -882,7 +888,7 @@ class EncryptionTest(E2ECase):
             dlg.pwid.setText("after")
             dlg._ok()
 
-        with mock.patch.object(vboxfront, "write_secret_file", spy):
+        with mock.patch.object(media_dialogs_module, "write_secret_file", spy):
             self.run_dialog(w.encrypt_selected, change)
             self.assertTrue(self.settled())
 
@@ -1351,7 +1357,10 @@ class CompressedImportTest(E2ECase):
         w = self.open_window()
 
         def prepare(dlg):
-            # The gzip trailer carries the size, so nothing has to be measured.
+            # gzip metadata cannot establish the full length.
+            self.assertEqual(dlg.size_edit.text(), "")
+            dlg._measure()
+            self.assertTrue(wait_until(lambda: dlg._measure_worker is None))
             self.assertEqual(dlg.size_edit.text(), str(size))
             dlg.path_edit.setText(target)
             dlg._ok()
@@ -1390,6 +1399,7 @@ class CompressedImportTest(E2ECase):
             # bzip2 records no length at all, so the field starts empty.
             self.assertEqual(dlg.size_edit.text(), "")
             dlg._measure()
+            self.assertTrue(wait_until(lambda: dlg._measure_worker is None))
             self.assertEqual(dlg.size_edit.text(), str(len(payload)))
             dlg.path_edit.setText(target)
             dlg._ok()
@@ -1636,6 +1646,202 @@ class PlanModeTest(E2ECase):
             "plan mode ran a command",
         )
         self.assertEqual(len(self.calls()), before)
+
+
+class ReviewSafetyTest(E2ECase):
+    def tearDown(self):
+        vboxfront.set_plan_mode(False)
+        super().tearDown()
+
+    def test_batch_overwrites_work_when_run_from_plan(self):
+        self.seed_disk("a.vdi", capacity_mb=2)
+        self.seed_disk("b.vdi", capacity_mb=2)
+        out = os.path.join(self.dir, "out")
+        os.makedirs(out)
+        for name in ("a-converted.vdi", "b-converted.vdi"):
+            with open(os.path.join(out, name), "wb") as handle:
+                handle.write(b"old output")
+        w = self.open_window()
+        self.select_many(["a.vdi", "b.vdi"])
+        vboxfront.set_plan_mode(True)
+
+        def prepare(dlg):
+            dlg.dir_edit.setText(out)
+            dlg.fmt.setCurrentText("VDI")
+            with mock.patch.object(QMessageBox, "question", return_value=YES):
+                dlg._ok()
+
+        # Only replace the batch dialog's exec; the plan uses its own Run result.
+        with mock.patch.object(vboxfront.PlanDialog, "exec", return_value=vboxfront.PlanDialog.RUN):
+            self.run_dialog(w.convert_selected, prepare)
+        self.assertTrue(self.settled())
+        self.assertEqual(len([c for c in self.calls() if c.startswith("clonemedium ")]), 2)
+        for name in ("a-converted.vdi", "b-converted.vdi"):
+            self.assertEqual(os.path.getsize(os.path.join(out, name)), 2 << 20)
+
+    def test_first_clone_failure_preserves_later_overwrite_target(self):
+        self.seed_disk("a.vdi", capacity_mb=2)
+        self.seed_disk("b.vdi", capacity_mb=2)
+        out = os.path.join(self.dir, "out")
+        os.makedirs(out)
+        later = os.path.join(out, "b-converted.vdi")
+        with open(later, "wb") as handle:
+            handle.write(b"keep this output")
+        w = self.open_window()
+        self.select_many(["a.vdi", "b.vdi"])
+
+        def prepare(dlg):
+            dlg.dir_edit.setText(out)
+            dlg.fmt.setCurrentText("VDI")
+            with mock.patch.object(QMessageBox, "question", return_value=YES):
+                dlg._ok()
+            # Simulate the first source disappearing after the listing.
+            state = self.read_state()
+            state['media'] = [m for m in state['media'] if m['location'].endswith('b.vdi')]
+            self.write_state(**state)
+
+        self.run_dialog(w.convert_selected, prepare)
+        self.assertTrue(self.settled())
+        self.assertEqual(len([c for c in self.calls() if c.startswith("clonemedium ")]), 1)
+        with open(later, "rb") as handle:
+            self.assertEqual(handle.read(), b"keep this output")
+
+
+class ModularFeaturesTest(E2ECase):
+    def test_overwrite_failure_restores_previous_output(self):
+        source = self.seed_disk("source.vdi", capacity_mb=2)
+        target = os.path.join(self.dir, "previous.vdi")
+        with open(target, "wb") as handle:
+            handle.write(b"original output")
+        w = self.open_window()
+        self.select("source.vdi")
+
+        def prepare(dlg):
+            dlg.path_edit.setText(target)
+            with mock.patch.object(QMessageBox, "question", return_value=YES):
+                dlg._ok()
+            state = self.read_state()
+            state['media'] = []
+            self.write_state(**state)
+
+        self.run_dialog(w.convert_selected, prepare)
+        self.assertTrue(self.settled())
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), b"original output")
+        failed = w.operation_journal.unresolved()
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0].state, 'failed')
+        self.assertFalse(os.path.exists(failed[0].backup))
+
+    def test_successful_overwrite_removes_its_temporary_backup(self):
+        self.seed_disk("source.vdi", capacity_mb=2)
+        target = os.path.join(self.dir, "previous.vdi")
+        with open(target, "wb") as handle:
+            handle.write(b"original output")
+        w = self.open_window()
+        self.select("source.vdi")
+
+        def prepare(dlg):
+            dlg.path_edit.setText(target)
+            with mock.patch.object(QMessageBox, "question", return_value=YES):
+                dlg._ok()
+
+        self.run_dialog(w.convert_selected, prepare)
+        self.assertTrue(self.settled())
+        self.assertEqual(os.path.getsize(target), 2 << 20)
+        self.assertFalse(w.operation_journal.unresolved())
+        self.assertFalse(any('.vboxfront-backup-' in f for f in os.listdir(self.dir)))
+
+    def test_delete_undo_survives_window_restart(self):
+        original = self.seed_disk("undo.vdi", capacity_mb=2)
+        w = self.open_window()
+        self.select("undo.vdi")
+        self.delete_the_file(w)
+        self.assertTrue(self.settled())
+        self.assertFalse(os.path.exists(original['location']))
+        w.close()
+        w.deleteLater()
+        QApplication.processEvents()
+        self.window = None
+        restarted = self.open_window()
+        self.assertTrue(restarted.act_undo_delete.isEnabled())
+        restarted.undo_delete()
+        self.assertTrue(self.settled())
+        self.assertTrue(os.path.exists(original['location']))
+        self.assertIn('undo.vdi', self.rows())
+
+    def test_failed_batch_can_retry_its_failed_command(self):
+        source = self.seed_disk("source.vdi", capacity_mb=2)
+        w = self.open_window()
+        target = os.path.join(self.dir, 'retried.vdi')
+        args = vboxfront.clone_args('disk', 'missing-source', target)
+        w._run_queue([(args, None, None)], 'clone')
+        self.assertTrue(self.settled())
+        report = w._batch_report
+        self.assertEqual(report.items[0].state, 'failed')
+        # The original UUID becomes available again before the guarded retry.
+        state = self.read_state()
+        state['media'][0]['uuid'] = 'missing-source'
+        self.write_state(**state)
+        from vboxfront_app.features import BatchResultsDialog as ActualDialog
+        def retry(dlg):
+            dlg.tree.topLevelItem(0).setSelected(True)
+            with mock.patch.object(QInputDialog, 'getText', return_value=('RUN', True)):
+                dlg.retry_failed()
+            return 1
+        with mock.patch.object(ActualDialog, 'exec', retry):
+            w.open_batch_results()
+        self.assertTrue(self.settled())
+        self.assertTrue(os.path.exists(target))
+        self.assertEqual(w._batch_report.items[0].state, 'succeeded')
+
+    def test_vm_storage_view_attaches_and_detaches_a_slot(self):
+        medium = self.seed_disk("source.vdi", capacity_mb=2)
+        w = self.open_window()
+        from vboxfront_app.library_views import StorageSlot
+        slot = StorageSlot(VM_UUID, 'alpha', 'SATA', 1, 0, '')
+        w._apply_storage_request(('attach', slot, 'disk', medium['uuid']))
+        self.assertTrue(self.settled())
+        state = self.read_state()
+        attachments = state['vms'][0]['attachments']
+        self.assertEqual(len(attachments), 1)
+        # The display uses the path returned by showvminfo as its occupant.
+        occupied = StorageSlot(VM_UUID, 'alpha', 'SATA', 1, 0, medium['location'])
+        w._apply_storage_request(('detach', occupied, '', ''))
+        self.assertTrue(self.settled())
+        self.assertEqual(self.read_state()['vms'][0]['attachments'], [])
+
+    def test_saved_filter_survives_window_restart(self):
+        self.seed_disk('keep.vdi', capacity_mb=2)
+        w = self.open_window()
+        w._filter_store.save('VDIs only', 'fmt:vdi')
+        w.close()
+        w.deleteLater()
+        QApplication.processEvents()
+        self.window = None
+        restarted = self.open_window()
+        index = restarted.saved_filters.findText('VDIs only')
+        self.assertGreater(index, 0)
+        restarted.apply_saved_filter(index)
+        self.assertEqual(restarted.filter_edit.text(), 'fmt:vdi')
+
+    def test_registry_snapshot_comparison_detects_a_move(self):
+        medium = self.seed_disk('before.vdi', capacity_mb=2)
+        w = self.open_window()
+        from vboxfront_app.persistence import write_registry_snapshot
+        from vboxfront_app.snapshots import load_snapshot, compare_registry, current_rows
+        path = write_registry_snapshot(w.media, 'comparison test')
+        state = self.read_state()
+        renamed = os.path.join(self.images, 'after.vdi')
+        os.rename(medium['location'], renamed)
+        state['media'][0]['location'] = renamed
+        self.write_state(**state)
+        w.refresh_media()
+        self.assertTrue(self.settled())
+        changes = compare_registry(load_snapshot(path), current_rows(w.media))
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0].change, 'moved')
+        self.assertEqual(changes[0].uuid, medium['uuid'])
 
 
 if __name__ == "__main__":

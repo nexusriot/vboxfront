@@ -20,7 +20,7 @@ BUILD    := ./scripts/build.sh
 DEB      := ./scripts/build-deb.sh
 E2E      := ./e2e/run.sh
 DIST     := dist
-APPVER   := $(shell sed -n 's/^APP_VERSION = "\(.*\)"/\1/p' vboxfront.py)
+APPVER   := $(shell sed -n 's/^APP_VERSION = "\(.*\)"/\1/p' vboxfront_app/version.py)
 VERSION  ?= $(shell git describe --tags --dirty 2>/dev/null || echo $(APPVER))
 export VERSION
 

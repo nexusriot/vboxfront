@@ -9,14 +9,13 @@ what's left or new.
 
 ## Delivered in 1.9.0
 
-Both "Suggested next" blocks below, less the package split — deliberately
-left for its own pass, since it would churn every file the features touch.
-The trash and undo of 1.8.0 came from the first block too.
+The two 2026-10-18 proposal rounds are implemented. The subsequent modular
+refactor and recovery/library enhancements shipped in 1.10.0, listed below.
+The original trash and session undo arrived in 1.8.0.
 
 - [x] Import a compressed raw image without unpacking it
-      (`convertfromraw stdin`): gzip, bzip2 and xz, with the byte count read
-      from the gzip trailer where there is one and measured in one streaming
-      pass otherwise.
+      (`convertfromraw stdin`): gzip, bzip2 and xz. Use Measure for the exact
+      byte count or enter a known size; gzip trailers cannot establish it.
 - [x] Export to a flat raw image (`clonemedium --format RAW`).
 - [x] Health: **Clean up…** unregisters entries whose file is gone;
       **Check attach flags** reports disks attached without `--discard`.
@@ -56,7 +55,7 @@ The trash and undo of 1.8.0 came from the first block too.
       the totals line went on counting them. Guarding the recursion is not
       the same as drawing the row — every record now gets exactly one.
 - [x] Batch convert deleted a disk it was about to convert. Existing targets
-      are all removed before the queue starts, so a plan aiming one disk's
+      used to be removed before the queue starts, so a plan aiming one disk's
       clone at another's backing file destroyed that disk before its own turn.
       Re-running a convert over its own output folder did precisely that with
       the default suffix.
@@ -72,13 +71,14 @@ The trash and undo of 1.8.0 came from the first block too.
 - [x] An export to a name ending in `.csv`/`.json` writes that format
       whatever the filter combo was showing.
 - [x] Quitting mid-command removes the password files: `QProcess.finished`
-      is what triggers the shred and it never arrives when the process is
-      killed on the way out.
+      normally triggers removal, but application teardown can skip that
+      callback, so close also requests cleanup explicitly.
 - [x] **M** — Hermetic end-to-end suite in Docker (`make e2e`): the real app
       against a *stateful* fake VBoxManage — a registry that persists and
       real image files — so a workflow is checked by what it changed, not by
-      what it printed. 40 scenarios, no VirtualBox, no display, no network;
-      also a CI job.
+      what it printed. The initial suite had 40 scenarios; the current suite
+      has 72. Container execution needs no VirtualBox, display or network and
+      is also a CI job.
 
 ## Correctness / polish
 
@@ -98,14 +98,14 @@ The trash and undo of 1.8.0 came from the first block too.
       one stdin stream do **not** work (the first `readPasswordFile("stdin")`
       swallows the buffered read; the second fails
       `VBOX_E_PASSWORD_INCORRECT`), so it uses two 0600 temp files created at
-      launch time and shredded on exit.
+      launch time and removed on exit.
 - [x] **S** — `CaptureRunner` deadline *(1.3.0)*, 120 s. A wedged VBoxManage
       used to leave `_refreshing` set forever, silencing every later refresh.
       Reproducible: `mediumio stream` deadlocks on 7.2.12 and wedges VBoxSVC
       until it is SIGKILLed — do not build anything on that subcommand.
 - [x] **S** — Re-run a command from the history panel *(1.6.0)*. Safe once
       the two ways it goes wrong are closed off: a command whose secret went
-      over stdin or through a since-shredded temp file is refused outright
+      over stdin or through a since-removed temp file is refused outright
       (it would hang or fail), and a destructive one needs the word RUN
       typed rather than a default button pressed.
 - [x] **S** — Attach dialog: the device spin now comes from
@@ -195,145 +195,37 @@ The trash and undo of 1.8.0 came from the first block too.
       leaving the user to wonder why nothing changed. The schema lookup has
       to upper-case the format — `list -l` reports `vdi`, backend ids are
       `VDI`.
-- [ ] **L** — Optional VM panel: list VMs with their storage trees, as an
-      alternate root view (media-per-VM instead of VM-per-media). Most of the
-      parsing exists (`vm_storage_controllers`, `controller_types`,
-      `find_attachment`) — what is missing is the pane and the action routing.
-- [ ] **M** — Refresh cost: the chain is strictly sequential, one
-      `showmediuminfo` process per library entry plus three `list -l` calls.
-      Fine for a small library, visibly slow for a large one; the library
-      probes are read-only and could overlap, or be cached by mtime.
-- [ ] **S** — Elapsed time and an ETA on the progress bar, and a notification
-      when an operation that ran for more than half a minute finishes.
-- [ ] **M** — Split the single module into a package (`parsers`, `args`,
-      `dialogs`, `ui`). At ~5k lines it is past the edge of comfortable, and
-      every feature round makes the next one harder to place.
+- [x] **L** — VM storage view with controller/slot trees and attach/detach
+      actions. Slot occupants are rechecked before issuing commands.
+- [x] **M** — Refresh cost *(1.9.0)*: unchanged library probes are cached by
+      mtime and size. Missing registry entries invalidate the cached stamps
+      so the next refresh reopens them. The chain stays sequential.
+- [x] **S** — Elapsed time and ETA *(1.9.0)*, plus a window alert and verdict
+      when an operation running for more than half a minute finishes.
+- [x] **M** — Split the application into `vboxfront_app` domain, command,
+      persistence, service, process, widget and dialog modules, retaining the
+      entry-point import facade. The refactor passed the full baseline suites.
 
-## Suggested next (proposed 2026-10-18, after the 1.7.0 review)
+## Remaining work from the 2026-10-18 proposals
 
-Ordered by value for the effort, with what each one is actually worth.
+The original feature proposals are delivered. Registry snapshots live in the
+per-user data directory. Long operations use a window alert; native desktop
+notifications remain a possible enhancement.
 
-- [x] **S** — **Safety net for `closemedium --delete`.** Done in 1.8.0: the
-      file is renamed into a trash folder (configurable, default
-      `.vboxfront-trash/` beside the image) instead of being unlinked, and
-      *Media → Undo delete* puts the last delete back — a batch as one batch
-      — for the rest of the session. `--delete` is only sent when the trash
-      is turned off in Settings. Still open: emptying the trash from inside
-      the app, and an undo that survives a restart.
-- [ ] **S** — **Default image folder in Settings.** Create disk, Create
-      floppy and Create differencing all start at `~/new-disk.vdi`, which is
-      almost never where images live. Remember the last folder used per
-      dialog, seeded from a configurable default (VirtualBox's own
-      `machinefolder` is a good first guess).
-- [ ] **S** — **Honour the palette instead of hardcoded colours.** There are
-      21 literal `#888` / `QColor(220, 80, 80)` / `#c05000` sites. On a dark
-      theme the greys are washed out and the inline warnings are hard to
-      read. Derive them from `QPalette` once and reuse, so the window matches
-      whatever the user runs.
-- [ ] **S** — **A visible queue.** A batch of 30 compacts is one status-bar
-      number today; nothing says what is left or lets the rest be dropped
-      without killing the one in flight. A small list with "skip the rest"
-      turns a long batch from a commitment into a decision.
-- [ ] **M** — **Plan mode.** Let a batch dialog print the exact commands it
-      would run, to the output panel or the clipboard, without running them.
-      It fits the ethos better than anything else here — every action is
-      already a visible VBoxManage command, and this makes the list portable
-      to a script or a change ticket.
-- [ ] **S** — **Structured filter.** `fmt:vdi`, `size:>10G`, `vm:alpha`,
-      `state:inaccessible` alongside the current substring match. The columns
-      to filter on already exist; the registries where filtering matters are
-      exactly the ones where a substring is not enough.
-- [ ] **M** — **Registry drift detection.** VBoxFront is not the only thing
-      that writes the registry; the VirtualBox GUI, a VM start, or another
-      copy of this app can change it under an open window. Hash the listing
-      on each refresh and say so when it moved without an action of ours,
-      rather than letting a stale row target the wrong medium.
-- [ ] **S** — **Explain a snapshot-only attachment.** A medium attached only
-      inside a snapshot is listed as in use, but `storageattach` cannot
-      detach it — the slot is not in the current state, so the batch reports
-      "could not locate" and leaves the user guessing. The Snapshot column
-      already knows; say "attached in snapshot X, which only deleting that
-      snapshot can undo".
-- [ ] **S** — **Elapsed time and ETA on the progress bar**, plus a desktop
-      notification when something that ran over ~30 s finishes. (Carried over
-      from the earlier backlog; a clone of a large fixed image is a coffee
-      break, and the window gives no sense of how long is left.)
-- [ ] **M** — **Faster refresh** (carried over). The chain is strictly
-      sequential: one `showmediuminfo` per library entry plus three `list -l`
-      calls. Cache the library probes by mtime, or overlap them — they are
-      read-only, and a large library makes every F5 and every post-command
-      refresh visibly slow.
-- [ ] **M** — **Split the module into a package** (carried over, and now
-      overdue at ~5.2k lines). `parsers`, `args`, `dialogs`, `ui`. Each round
-      makes the next one harder to place, and the e2e suite now gives the
-      cover to do it safely.
+## Delivered in 1.10.0 (2026-10-22)
 
-## Suggested next, round two (proposed 2026-10-18)
+- [x] Recoverable overwrite targets for file-producing clone/import/export.
+- [x] Trash manager with selected restore/delete and persistent batch undo.
+- [x] Failed/interrupted operation recovery with partial files and guarded retry.
+- [x] Background archive measurement, cancellation and source-signature cache.
+- [x] VM/controller/slot storage view with direct attach/detach actions.
+- [x] Read-only registry snapshot comparison.
+- [x] Named saved filters with apply/replace/delete controls.
+- [x] Batch outcome summary with guarded retry of selected failures.
 
-Where the first block was mostly safety and polish, this one is about reach:
-things VBoxManage can already do that the app never offers, and places where
-a feature stops one step short of the job.
-
-- [ ] **S** — **Import a compressed raw image without unpacking it first.**
-      `convertfromraw stdin <out> <bytes>` is in 7.2.12's usage and the app
-      has never used it: today a 40 GB `.img.gz` has to be extracted to a
-      40 GB temp file before Import RAW will look at it. Piping
-      `gunzip -c`/`xz -d`/`zstd -d` into the child's stdin needs the byte
-      count up front, which `gzip -l` or the archive header gives. The stdin
-      plumbing already exists for passwords.
-- [ ] **S** — **Export to a flat raw image.** `clonemedium` takes
-      `--format RAW` (confirmed in its usage line), but the format combos are
-      built from `disk_backends()`, which drops RAW because its backend
-      registers no HardDisk extension — so the one direction the app cannot
-      go is *out*. Import RAW has existed since 1.1.0 with no counterpart. A
-      separate "Export to raw image…" action that bypasses the backend list
-      is the asymmetry fixed; it is what feeds `dd`, a USB stick or qemu.
-- [ ] **S** — **Let the health dialog clean up after itself.** It already
-      finds registry entries whose backing file is gone — the most common
-      way a registry rots — and can only point at them. One guided
-      "unregister the N entries whose file is missing" pass (plain
-      `closemedium`, nothing deleted, since the file is gone already) turns
-      the report into a fix. The batch queue and the blocked/removable
-      sorting from Remove are both already there.
-- [ ] **M** — **Flag disks attached without `--discard`.** This is why a
-      compact so often gives nothing back: without it the guest's TRIM never
-      reaches the image, so freed blocks stay allocated forever. The attach
-      dialog offers the flag and nothing ever reports its absence.
-      `showvminfo --machinereadable` already prints
-      `"<ctl>-discard-<port>-<device>"="off"` per slot; the cost is that the
-      health pass would have to read the VMs, not just the registry.
-- [ ] **S** — **A details pane for the selected medium.** `Info` shells out
-      to `showmediuminfo` and dumps text into the output panel, yet every
-      field is already parsed into the `MediumRecord` on screen — description,
-      properties, the full in-use list, access error, parent. A side panel
-      costs no command and stops the output panel being used as a viewer.
-- [ ] **M** — **Multi-select for Attach and Properties.** 1.6.0 took compact,
-      remove, detach and convert multi-select and left these two behind, so
-      filling a VM's ports or setting `multiattach` on six disks is still one
-      dialog at a time. Attach needs a port-allocation loop over the free
-      slots; Properties needs the dialog to show what the selection has in
-      common and only send what was changed.
-- [ ] **S** — **Export selected history as a shell script.** The history
-      already holds every command verbatim with its exit code, and "every
-      action is a visible VBoxManage command" is the whole ethos — one more
-      step makes a session reproducible somewhere without a GUI, or pasteable
-      into a change ticket. Pairs with plan mode above.
-- [ ] **S** — **Tell the orphan scan why an image cannot be registered.** It
-      finds unregistered images and adds them to the library, but the common
-      reason one is unregistered is that its UUID collides with an image that
-      already is — a copied `.vdi`. The scan could read each candidate's UUID
-      (`showmediuminfo <path>`, which it effectively does anyway) and say
-      "collides with X; Image UUID tools can stamp it", which is the exact
-      fix the app already ships and nothing currently points at.
-- [ ] **S** — **Snapshot the registry before a destructive batch.** The CSV
-      /JSON export already serialises the whole listing. Writing one
-      automatically beside the trash before a batch remove or batch convert
-      costs nothing and is the difference between "something went wrong" and
-      "here is what it looked like". Complements the 1.8.0 trash.
-- [ ] **S** — **Column chooser and more shortcuts.** Eleven columns are
-      always shown, which is a horizontal scroll on a laptop, and only six
-      actions have keys (no compact, resize, attach or detach). Both are
-      small, and the header state is already persisted.
+Still open: whole-image backup for multi-file formats, rollback for in-place
+`--existing` clones, and persistent batch outcomes (file failures are persistent;
+the complete batch report lasts for the window session).
 
 ## Packaging / project
 

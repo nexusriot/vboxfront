@@ -14,7 +14,7 @@ ROOT="$PWD"
 APP="vboxfront"
 # Fall back to the source's own APP_VERSION when the caller (or the Makefile's
 # `git describe`) has nothing to offer — never to a literal that can go stale.
-VERSION="${VERSION:-$(sed -n 's/^APP_VERSION = "\(.*\)"/\1/p' "$ROOT/vboxfront.py")}"
+VERSION="${VERSION:-$(sed -n 's/^APP_VERSION = "\(.*\)"/\1/p' "$ROOT/vboxfront_app/version.py")}"
 VERSION="${VERSION#v}"                       # drop leading "v"
 # Debian requires Version to start with a digit. `git describe --always`
 # falls back to a bare commit hash when no tags exist — prefix it so dpkg
@@ -31,7 +31,8 @@ BIN="$ROOT/dist/$APP"
 # disagree about what they are.
 if [ ! -f "$BIN" ] \
    || [ "$ROOT/vboxfront.py" -nt "$BIN" ] \
-   || [ "$ROOT/vboxfront.spec" -nt "$BIN" ]; then
+   || [ "$ROOT/vboxfront.spec" -nt "$BIN" ] \
+   || [ -n "$(find "$ROOT/vboxfront_app" -name '*.py' -newer "$BIN" -print -quit 2>/dev/null)" ]; then
     echo ">> binary $BIN missing or older than the sources; building first"
     "$ROOT/scripts/build.sh"
 fi

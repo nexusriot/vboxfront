@@ -8,5 +8,13 @@
 build/
 dist/
 **/__pycache__/
-*.pyc
+**/*.py[cod]
 *.deb
+
+# Runtime image backups/trash can be large and never belong in a build context.
+**/.vboxfront-trash/
+**/*.vboxfront-backup-*
+**/*.vboxfront-partial-*
+*.spec.bak
+**/.DS_Store
+**/Thumbs.db

@@ -6,10 +6,24 @@
 /build/
 /dist/
 
-# Bytecode caches appear beside the sources and under tests/.
+# Python bytecode is generated beside sources as well as in cache folders.
 __pycache__/
+*.py[cod]
 
 # PyInstaller spec files are usually generated, but vboxfront.spec is the
 # hand-maintained build input required by scripts/build.sh — keep it tracked.
 *.spec
 !/vboxfront.spec
+
+# Backup specs cleaned by `make clean`.
+/*.spec.bak
+
+# User image recovery files can be created anywhere images are stored.
+# Do not ignore ordinary disk images or JSON fixtures: those may be test inputs.
+.vboxfront-trash/
+*.vboxfront-backup-*
+*.vboxfront-partial-*
+
+# Desktop metadata on the supported macOS/Windows development platforms.
+.DS_Store
+Thumbs.db

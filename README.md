@@ -1,13 +1,15 @@
 # VBoxFront
 
+Current source version: **1.10.0**.
+
 A small PyQt6 desktop frontend for `VBoxManage` media operations.
 
 VirtualBox ships a powerful but verbose CLI for managing virtual disks.
 VBoxFront wraps the media-related subcommands in a single window so you can
 list, inspect, create, compact, resize, clone/convert, import, encrypt,
 attach and detach disk images without memorising `VBoxManage` invocations.
-Every command is shown verbatim and its output is streamed live, so it stays
-transparent about what it runs.
+Interactive operations show their command and stream its output live.
+Background registry/VM probes use a separate buffered runner.
 
 Architecture and design decisions are documented in [DESIGN.md](DESIGN.md);
 the open backlog lives in [ROADMAP.md](ROADMAP.md).
@@ -46,8 +48,8 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
   pasted Windows path, say — stays a plain word.
 - **Details pane** (`Ctrl+J`) — every field of the selected medium, laid out.
   It comes from the listing already on screen, so opening it runs nothing.
-- **Create disk** — `createmedium` with format, variant and size, both taken
-  from what VirtualBox reports it can create (see *Formats from VirtualBox*).
+- **Create disk** — `createmedium` with a size in MB and format/variant
+  choices taken from VirtualBox (see *Formats from VirtualBox*).
 - **Formats from VirtualBox** — the create and convert dialogs ask
   `list hddbackends` which formats exist, which can be created, and which
   variants each accepts, instead of hardcoding a list. QCOW, QED and
@@ -81,10 +83,14 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
   (`clonemedium --format --variant`), into a new file or into a pre-created
   one (`--existing`). A selection of disks can be converted into one folder in
   a single queued run, with the target names previewed first. An existing
-  target has to be deleted before the clone that replaces it, so one that is
+  target is moved to a backup beside the output before cloning, so one that is
   another registered medium's backing file is named (with its UUID) before
   anything is removed, and one that is another disk in the same batch is
-  refused outright.
+  refused outright. Each backup is removed only after its clone succeeds;
+  failure restores the original and preserves any partial output separately.
+  This also applies when Run is chosen from plan mode. Skipped targets remain
+  untouched. Cloning into an existing image (`--existing`) writes in place
+  and does not have automatic rollback.
 - **Free-space preflight** — create, resize and clone show the target
   filesystem's free space against what the operation will take, and confirm
   before starting one that does not fit. VBoxManage does not reserve space up
@@ -92,12 +98,16 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
   file behind.
 - **Import RAW** — convert a raw `.img/.raw/.bin` into a managed format
   (`convertfromraw`); the result lands in the media library automatically.
+  Import and RAW export refuse targets belonging to registered media.
 - **Import compressed RAW** — the same for a `.gz/.bz2/.xz` archive, without
   unpacking it first (`convertfromraw stdin`): the archive is decompressed
   straight into VBoxManage, so a 40 GB `.img.gz` never needs 40 GB of temp
-  space. The byte count the command requires is read from the gzip trailer
-  where there is one, and otherwise measured by a single pass over the
-  (smaller) archive.
+  space. Use **Measure…** to obtain the exact byte count in one streaming
+  pass on a background worker, or enter a known size. Measurement can be
+  cancelled; completed results are cached while the source remains unchanged.
+  Gzip trailers wrap at 4 GiB and describe only the last member of concatenated archives, so they are never trusted.
+  Read errors and size mismatches fail the operation; a failed import may
+  leave a partial output file, which is not added to the library.
 - **Export to raw** — clone a disk out to a flat image
   (`clonemedium --format RAW`), which is what feeds `dd`, a USB stick or
   qemu. RAW is never offered as a *managed* format, because its backend
@@ -145,7 +155,8 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
   (`--newpassword stdin`); changing a password needs two secrets in one call,
   which stdin cannot carry, so those go through 0600 temp files that are
   removed the moment the command exits. Neither ever reaches the command
-  line. The cipher and password ID of encrypted media are shown in the
+  line. Removal does not guarantee secure erasure from the filesystem. The
+  cipher and password ID of encrypted media are shown in the
   listing's Encryption column.
 - **Remove** — unregister (`closemedium`), optionally deleting the backing
   file; defaults to the safe keep-file action. Deleting does **not** pass
@@ -153,8 +164,11 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
   hidden `.vboxfront-trash/` beside the image, so the move is a rename inside
   one filesystem and costs nothing however large the disk is), and
   *Media → Undo delete* puts the last delete back — the whole batch of it —
-  for the rest of the session, library entry included. Nothing is ever emptied
-  automatically. The trash can be pointed elsewhere or turned off in
+  including after restarting, library entry included. **Media → Trash
+  manager…** lists indexed deleted files with logical and allocated sizes,
+  restores selected files, and permanently deletes selected files after
+  confirmation. Nothing is ever emptied automatically. The trash can be
+  pointed elsewhere or turned off in
   *File → Settings*, and with it off `--delete` is sent for real.
 - **Resolve** — rescue a medium VirtualBox can no longer read: re-point the
   registry at a file that moved (`modifymedium --setlocation`), or check and
@@ -166,7 +180,8 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
   past *"a medium with the same UUID already exists"* after copying a `.vdi`.
 - **Contents** — read a byte range straight out of an image, with no VM, no
   loop mount and no root (`mediumio cat`): hex dump it into the output panel
-  or extract it to a file. Goes through VirtualBox's own backend stack, so it
+  or extract it to a file. Extraction refuses output paths belonging to
+  registered media. Goes through VirtualBox's own backend stack, so it
   works on any supported format, on differencing chains, and on encrypted
   media (which refuse to be read without their password).
 - **Differencing images** — create a child on top of an existing disk
@@ -179,7 +194,7 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
 - **Command history** — every command run, with its exit code, in
   *File → Command history…*; copy one, all, or the current command line
   straight from the output panel, or **re-run** one. A command whose password
-  went over stdin or through a temp file that has since been shredded is
+  went over stdin or through a temp file that has since been removed is
   refused rather than replayed into a hang; a destructive one needs the word
   RUN typed. "Destructive" is about what a replay would overwrite, not how
   the verb reads: `clonemedium --existing` and `mediumio cat --output=<file>`
@@ -210,15 +225,44 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
 - Live command output panel with a **Cancel** button; the media list
   refreshes automatically after each operation.
 
+### Recovery and library views
+
+- **File → Operation recovery…** lists failed or interrupted file-producing
+  clone/import/export operations. Inspect their files, restore a saved original,
+  remove an unchanged partial output with confirmation, or retry after typing
+  RUN. Compressed imports reopen the original archive. Passwords and stdin
+  contents are never stored. Startup reports unfinished operations in the output.
+- **File → Batch results…** shows succeeded, failed and skipped commands for
+  the latest batch. Select failures and type RUN to retry them. Commands needing
+  stdin or expired password files must use their original dialog. Results are
+  kept for the current window session.
+- **File → Compare registry snapshot…** compares a saved JSON snapshot with
+  the current listing by media kind and UUID. Added, missing, moved and other
+  changed fields appear in a read-only table. Refresh first for current data.
+- **Media → VM storage…** shows VMs, controllers, and occupied/empty slots.
+  Attach an image to an empty slot or detach an occupied one. The slot is
+  rechecked before issuing the command; changed slots require reopening the view.
+- **Saved filters** live beside the filter box on a separate toolbar. Save the
+  current expression under a name, apply it later, or delete the saved view.
+
+Output recovery records live in `$XDG_DATA_HOME/vboxfront/operations.json.d/`
+(or `~/.local/share/vboxfront/operations.json.d/`). Backups and preserved partials
+stay beside the output file. Recovery protects the named backing file; it does
+not provide whole-VM rollback or a backup of every companion file in multi-file
+image formats. Existing-image clones (`--existing`) remain in-place writes.
+Trash/undo metadata and saved filters use the same per-user QSettings store as
+the library. The archive measurement cache lasts for the application session.
+
 ### The media library (modern VirtualBox note)
 
-Since VirtualBox dropped `VBoxManage openmedium`, there is no CLI way to
-*persistently* register a standalone image: `showmediuminfo` opens it only
-until the VBoxSVC daemon exits (a few seconds after the last client), and
-only `createmedium` or attaching to a VM persist across restarts. VBoxFront
-therefore keeps its own **library** of known image paths (in `QSettings`);
-**Add file…** stores the path and every refresh re-opens library entries so
-unattached images stay visible. Entries are dropped again when you remove
+VBoxFront keeps its own **library** of known image paths in `QSettings`,
+independently of VirtualBox's registry. This preserves the Add file list when
+VBoxSVC forgets a standalone image's temporary registration. Images created or
+attached through VirtualBox can also appear through its own registry.
+**Add file…** stores the path. Refresh reopens new or changed entries and
+uses cached file timestamps/sizes for unchanged ones. If the listing loses an
+entry, its cache is invalidated so the next refresh reopens it; another refresh
+may be needed after VBoxSVC exits. Entries are dropped again when you remove
 the medium (and can be managed in *File → Settings*).
 
 ## Requirements
@@ -278,8 +322,9 @@ display. To run the end-to-end suite against the host Python instead:
 make e2e-local
 ```
 
-CI (GitHub Actions) runs the unit suite, then the containerised end-to-end
-suite, then builds the .deb, on every push.
+CI (GitHub Actions) runs on pushes and pull requests. After the unit job
+passes, the containerised test job and the binary/.deb build job run
+independently; packaging is not gated on E2E success.
 
 ## Building
 
@@ -303,14 +348,16 @@ for the **host architecture**.
 
 ### Versioning
 
-`APP_VERSION` in `vboxfront.py` is the single source of truth — it names the
-window title, `vboxfront --version`, the macOS bundle version and the fallback
-the build scripts use. `VERSION` prefers `git describe` when the checkout has
+`APP_VERSION` in `vboxfront_app/version.py` is the single source of truth for
+the runtime version — it names the window title, `vboxfront --version`, the
+macOS bundle version and the fallback the build scripts use. `VERSION` prefers `git describe` when the checkout has
 tags, so a tagged build carries its tag (and `-dirty` when the tree is not
-clean). Override it explicitly:
+clean). This controls the Debian package version; it does not change
+`APP_VERSION` or the version reported by the executable. Override the package
+version explicitly:
 
 ```sh
-make VERSION=1.2.3 deb
+make VERSION=1.10.0 deb
 ```
 
 ## Installing the .deb
@@ -337,7 +384,28 @@ sudo dpkg -r vboxfront
 ## Project layout
 
 ```
-vboxfront.py          Single-file PyQt6 application
+vboxfront.py          CLI entry point and compatibility imports
+vboxfront_app/        Application package (domain, services, Qt UI)
+  version.py          Single source of the application version
+  app.py              QApplication startup
+  constants.py        CLI/UI vocabulary and capability flags
+  models.py           Media, backend, trash and health records
+  domain.py           Parsers, filters, media analysis and exports
+  commands.py         VBoxManage argument builders
+  persistence.py      Settings, library, folders and registry snapshots
+  recovery.py         Durable output backups and operation records
+  trash.py            Persistent deleted-file index
+  measurement.py      Cancellable archive worker and size cache
+  snapshots.py        Snapshot validation and comparison
+  library_views.py    Saved filters and VM slot models
+  batches.py          Batch outcome model
+  processes.py        Visible and captured QProcess runners
+  widgets.py          Media tree, details and shared widgets
+  theme.py            Palette-based semantic colours
+  *_dialogs.py        Dialog groups; attach_dialog.py handles attachments
+  features.py         Recovery and library-view UI actions
+  feature_dialogs.py  Recovery, trash, results, comparison and VM views
+  window.py           Main window and media workflows
 vboxfront.spec        PyInstaller spec (onefile, windowed)
 requirements.txt      Runtime Python dependency (PyQt6)
 tests/                Unit tests (stdlib unittest, offscreen Qt)
@@ -346,7 +414,8 @@ e2e/Dockerfile        Container the end-to-end suite runs in
 e2e/run.sh            Build and run it (`make e2e`)
 .dockerignore         Keeps the e2e build context to the sources it copies
 DESIGN.md             Architecture & design notes
-ROADMAP.md            Open backlog
+ROADMAP.md            Delivered features and open backlog
+REVIEW.md             Review findings, verification and known limitations
 build.py              Legacy ad-hoc PyInstaller invocation (kept for reference)
 Makefile              Wrapper over scripts/*.sh
 scripts/build.sh      PyInstaller build / run / test (provisions a local .venv)
@@ -358,10 +427,10 @@ build/                PyInstaller workdir (gitignored)
 
 ## Notes & limitations
 
-- All operations are exactly the `VBoxManage` subcommands shown in the output
-  panel — nothing is done behind your back.
-- Long operations (large compact/clone) block further actions until they
-  finish; use **Cancel** to abort. Batch compact queues commands one after
+- VBoxManage commands are shown in the output panel. Local trash moves and
+  recovery backups are also reported there.
+- Long operations (large compact/clone) block another visible operation;
+  background refresh captures may still run. The window remains responsive; use **Cancel** to abort. Batch compact queues commands one after
   another and stops on the first failure.
 - Compacting only meaningfully shrinks VDI images; other formats prompt for
   confirmation.

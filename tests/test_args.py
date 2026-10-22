@@ -393,9 +393,10 @@ class CompressedImportTest(unittest.TestCase):
             convertfromraw_stdin_args("/images/out.vdi", 10, "VDI", "Fixed"),
         )
 
-    def test_gzip_size_comes_from_the_trailer_without_reading_it(self):
+    def test_gzip_size_requires_measurement_even_for_small_archives(self):
         archive = self._compress(".gz", gzip.open)
-        self.assertEqual(uncompressed_size(archive), 3_000_000)
+        self.assertIsNone(uncompressed_size(archive))
+        self.assertEqual(measure_uncompressed(archive), 3_000_000)
 
     def test_a_wrapped_gzip_trailer_is_refused_rather_than_believed(self):
         # ISIZE is the length modulo 2^32, so it is wrong above 4 GiB. A value
@@ -405,6 +406,21 @@ class CompressedImportTest(unittest.TestCase):
         with open(archive, "r+b") as handle:
             handle.seek(-4, os.SEEK_END)
             handle.write(struct.pack("<I", 1))
+        self.assertIsNone(uncompressed_size(archive))
+
+    def test_concatenated_gzip_members_are_measured_in_full(self):
+        archive = self._compress(".gz", gzip.open)
+        with gzip.open(archive, "ab") as handle:
+            handle.write(b"x" * 1_000_000)
+        self.assertIsNone(uncompressed_size(archive))
+        self.assertEqual(measure_uncompressed(archive), 4_000_000)
+
+    def test_plausible_wrapped_gzip_trailer_is_not_trusted(self):
+        archive = self._compress(".gz", gzip.open)
+        with open(archive, "r+b") as handle:
+            handle.seek(-4, os.SEEK_END)
+            handle.write(struct.pack("<I", 2_000_000))
+        self.assertGreater(2_000_000, os.path.getsize(archive))
         self.assertIsNone(uncompressed_size(archive))
 
     def test_bzip2_and_xz_have_to_be_measured(self):
@@ -430,6 +446,12 @@ class CompressedImportTest(unittest.TestCase):
         archive = self._compress(".gz", gzip.open)
         with open(archive, "r+b") as handle:
             handle.truncate(os.path.getsize(archive) // 2)
+        self.assertIsNone(measure_uncompressed(archive))
+
+    def test_corrupt_xz_measures_as_unknown_instead_of_raising(self):
+        archive = self.raw + ".xz"
+        with open(archive, "wb") as handle:
+            handle.write(b"invalid xz stream")
         self.assertIsNone(measure_uncompressed(archive))
 
     def test_the_stream_decompresses_transparently(self):

@@ -8,9 +8,9 @@ import re
 from PyInstaller.utils.hooks import collect_all
 
 # APP_VERSION is the single source of truth; read it rather than restating it
-# (the source cannot be imported here — importing it pulls in PyQt6).
+# without importing the application and its Qt UI at build configuration time.
 APP_VERSION = re.search(
-    r'^APP_VERSION = "([^"]+)"', pathlib.Path("vboxfront.py").read_text(), re.M
+    r'^APP_VERSION = "([^"]+)"', pathlib.Path("vboxfront_app/version.py").read_text(), re.M
 ).group(1)
 
 datas, binaries, hiddenimports = collect_all("PyQt6")

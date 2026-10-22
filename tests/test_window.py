@@ -12,6 +12,8 @@ import unittest
 from unittest import mock
 
 import vboxfront
+import vboxfront_app.window as window_module
+import vboxfront_app.processes as process_module
 
 from PyQt6.QtCore import QByteArray, Qt
 
@@ -126,6 +128,9 @@ class FakeVBoxManageTest(unittest.TestCase):
 
     def setUp(self):
         self.workdir = tempfile.mkdtemp(prefix="vboxfront-fake-")
+        data_env = mock.patch.dict(os.environ, {"XDG_DATA_HOME": os.path.join(self.workdir, "data")})
+        data_env.start()
+        self.addCleanup(data_env.stop)
         self.log = os.path.join(self.workdir, "calls.log")
         self.fake = os.path.join(self.workdir, "VBoxManage")
         hdds = self.hdds_output()
@@ -149,6 +154,7 @@ class FakeVBoxManageTest(unittest.TestCase):
             f.write(script)
         os.chmod(self.fake, os.stat(self.fake).st_mode | stat.S_IXUSR)
         get_settings().setValue("vboxmanage_path", self.fake)
+        get_settings().remove("trash/batches")
         get_settings().remove("trash/enabled")
         get_settings().remove("trash/dir")
         for kind in KINDS:
@@ -166,6 +172,7 @@ class FakeVBoxManageTest(unittest.TestCase):
             self.window.close()
             self.window.deleteLater()
         get_settings().setValue("vboxmanage_path", "")
+        get_settings().remove("trash/batches")
         get_settings().remove("trash/enabled")
         get_settings().remove("trash/dir")
         QApplication.processEvents()
@@ -390,7 +397,7 @@ class MainWindowTest(FakeVBoxManageTest):
         w = self.make_window()
         secrets = [write_secret_file("old")]
         try:
-            with mock.patch.object(vboxfront, "vboxmanage_path", return_value=None):
+            with mock.patch.object(process_module, "vboxmanage_path", return_value=None):
                 w.runner.run(["encryptmedium", "u"], None, secrets)
             self.assertFalse(os.path.exists(secrets[0]))
         finally:
@@ -484,7 +491,7 @@ class MainWindowTest(FakeVBoxManageTest):
         clear_history()
         w.runner.run(["list", "hdds"])
         self.assertTrue(wait_until(lambda: not w.runner.is_busy() and not w._refreshing))
-        with mock.patch.object(vboxfront, "vboxmanage_path", return_value=None):
+        with mock.patch.object(process_module, "vboxmanage_path", return_value=None):
             w.runner.run(["encryptmedium", "other-disk", "--newpassword", "stdin"])
         QApplication.processEvents()
         entries = load_history()
@@ -787,11 +794,13 @@ class TrashHelperTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="vboxfront-trash-")
         get_settings().remove("trash/dir")
+        get_settings().remove("trash/batches")
         get_settings().remove("trash/enabled")
 
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
         get_settings().remove("trash/dir")
+        get_settings().remove("trash/batches")
         get_settings().remove("trash/enabled")
 
     def _image(self, name: str, body: bytes = b"disk") -> str:
@@ -1130,7 +1139,7 @@ class HealthAndScanTest(FakeVBoxManageTest):
             def dry_run_caveat(self):
                 return "[health] stub"
 
-        return mock.patch(f"vboxfront.{name}", Stub)
+        return mock.patch(f"vboxfront_app.window.{name}", Stub)
 
     def test_health_reveals_a_medium_in_its_own_tab(self):
         w = self.make_window()
@@ -1414,7 +1423,7 @@ class RegistrySnapshotTest(FakeVBoxManageTest):
             def exec(self):
                 return 1
 
-        with mock.patch("vboxfront.RemoveDialog", Stub):
+        with mock.patch("vboxfront_app.window.RemoveDialog", Stub):
             w.remove_selected()
         self.assertTrue(wait_until(
             lambda: not w.runner.is_busy() and not w._cmd_queue and not w._refreshing))
@@ -1432,7 +1441,7 @@ class RegistrySnapshotTest(FakeVBoxManageTest):
 
     def test_a_snapshot_that_cannot_be_written_does_not_stop_anything(self):
         w = self.make_window()
-        with mock.patch.object(vboxfront, "write_registry_snapshot",
+        with mock.patch.object(window_module, "write_registry_snapshot",
                                return_value=""):
             w._snapshot_registry("probe")
         self.assertIn("could not write a registry snapshot",
@@ -1593,3 +1602,190 @@ class StructuredFilterWindowTest(FakeVBoxManageTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewRegressionTest(FakeVBoxManageTest):
+    def tearDown(self):
+        set_plan_mode(False)
+        super().tearDown()
+
+    def test_batch_conversion_clears_only_the_target_about_to_run(self):
+        w = self.make_window()
+        disks = w.media['disk'][:2]
+        targets = [os.path.join(self.workdir, f'out{i}.vdi') for i in range(2)]
+        for path in targets:
+            with open(path, 'wb') as handle:
+                handle.write(b'original data')
+        commands = [vboxfront.clone_args('disk', disk.uuid, target)
+                    for disk, target in zip(disks, targets)]
+        dlg = mock.Mock(overwrite=targets)
+        dlg.exec.return_value = 1
+        dlg.commands.return_value = commands
+        with mock.patch.object(window_module, 'BatchConvertDialog', return_value=dlg), \
+             mock.patch.object(w.runner, 'run', return_value=True):
+            w._convert_batch(disks)
+            self.assertFalse(os.path.exists(targets[0]))
+            self.assertTrue(os.path.exists(targets[1]))
+            w.skip_queue()
+            w._on_runner_finished(1)
+        self.assertTrue(os.path.exists(targets[1]))
+
+    def test_plan_convert_run_prepares_targets_and_takes_snapshot(self):
+        w = self.make_window()
+        set_plan_mode(True)
+        commands = [vboxfront.clone_args('disk', m.uuid, f'/out/{i}.vdi')
+                    for i, m in enumerate(w.media['disk'][:2])]
+        dlg = mock.Mock(overwrite=[c[3] for c in commands])
+        dlg.exec.return_value = 1
+        dlg.commands.return_value = commands
+        with mock.patch.object(window_module, 'BatchConvertDialog', return_value=dlg), \
+             mock.patch.object(vboxfront.PlanDialog, 'exec', return_value=vboxfront.PlanDialog.RUN), \
+             mock.patch.object(w, '_snapshot_registry') as snapshot, \
+             mock.patch.object(w, '_clear_target', return_value=True) as clear, \
+             mock.patch.object(w.runner, 'run', return_value=True):
+            w._convert_batch(w.media['disk'][:2])
+            clear.assert_called_once_with(commands[0][3])
+            w._on_runner_finished(0)
+            self.assertEqual(clear.call_args_list, [mock.call(c[3]) for c in commands])
+            snapshot.assert_called_once_with('batch convert')
+            w._on_runner_finished(0)
+
+    def test_plan_convert_cancel_keeps_every_target(self):
+        w = self.make_window()
+        set_plan_mode(True)
+        dlg = mock.Mock(overwrite=['/out/a.vdi'])
+        dlg.exec.return_value = 1
+        dlg.commands.return_value = [vboxfront.clone_args('disk', 'uuid', '/out/a.vdi')]
+        with mock.patch.object(window_module, 'BatchConvertDialog', return_value=dlg), \
+             mock.patch.object(vboxfront.PlanDialog, 'exec', return_value=0), \
+             mock.patch.object(w, '_clear_target') as clear, \
+             mock.patch.object(w, '_snapshot_registry') as snapshot:
+            w._convert_batch(w.media['disk'][:2])
+        clear.assert_not_called()
+        snapshot.assert_not_called()
+
+    def test_export_declining_space_warning_preserves_existing_file(self):
+        w = self.make_window()
+        w.tabs.setCurrentIndex(0)
+        w.panes['disk'].select_uuid(w.media['disk'][0].uuid)
+        path = os.path.join(self.workdir, 'existing.img')
+        with open(path, 'wb') as handle:
+            handle.write(b'keep me')
+        with mock.patch.object(vboxfront.QFileDialog, 'getSaveFileName', return_value=(path, '')), \
+             mock.patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes), \
+             mock.patch.object(window_module, 'confirm_space', return_value=False):
+            w.export_raw()
+        with open(path, 'rb') as handle:
+            self.assertEqual(handle.read(), b'keep me')
+
+    def test_raw_import_refuses_registered_target(self):
+        w = self.make_window()
+        target = os.path.join(self.workdir, 'registered.vdi')
+        with open(target, 'wb') as handle:
+            handle.write(b'keep me')
+        w.media['disk'][0].location = target
+        with mock.patch.object(window_module, 'ask_target_format_and_path',
+                               return_value=('VDI', target, True)), \
+             mock.patch.object(QMessageBox, 'warning') as warning:
+            w.convert_from_raw('/source.raw')
+        warning.assert_called_once()
+        with open(target, 'rb') as handle:
+            self.assertEqual(handle.read(), b'keep me')
+
+    def test_stream_read_failure_cannot_be_reported_as_success(self):
+        w = self.make_window()
+        stream = mock.Mock()
+        stream.read.side_effect = EOFError('corrupt archive')
+        codes = []
+        w.runner.finished.connect(codes.append)
+        w.runner.run(['modifymedium', 'disk', 'uuid', '--compact'],
+                     stdin_stream=stream, stdin_total=100)
+        self.assertTrue(wait_until(lambda: bool(codes)))
+        self.assertNotEqual(codes[0], 0)
+        stream.close.assert_called_once()
+        self.assertIn('corrupt archive', w.runner.output.toPlainText())
+        # The failure flag must be reset for the next command.
+        w.runner.run(['modifymedium', 'disk', 'uuid', '--compact'])
+        self.assertTrue(wait_until(lambda: len(codes) == 2))
+        self.assertEqual(codes[1], 0)
+
+    def test_zero_crash_exit_is_failure_for_runner_and_capture(self):
+        from PyQt6.QtCore import QProcess
+        w = self.make_window()
+        codes = []
+        w.runner.finished.connect(codes.append)
+        w.runner._on_finished(0, QProcess.ExitStatus.CrashExit)
+        self.assertEqual(codes, [1])
+        results = []
+        capture = vboxfront.CaptureRunner(w, lambda code, output: results.append(code))
+        with mock.patch.object(capture, '_read'):
+            capture._done(0, QProcess.ExitStatus.CrashExit)
+        self.assertEqual(results, [1])
+
+
+    def test_xz_decompression_failure_fails_the_command(self):
+        import lzma
+        w = self.make_window()
+        stream = mock.Mock()
+        stream.read.side_effect = lzma.LZMAError('invalid xz data')
+        codes = []
+        w.runner.finished.connect(codes.append)
+        w.runner.run(['modifymedium', 'disk', 'uuid', '--compact'],
+                     stdin_stream=stream, stdin_total=100)
+        self.assertTrue(wait_until(lambda: bool(codes)))
+        self.assertNotEqual(codes[0], 0)
+        stream.close.assert_called_once()
+
+    def test_extraction_refuses_another_registered_backing_file(self):
+        w = self.make_window()
+        w.tabs.setCurrentIndex(0)
+        source, target = w.media['disk'][:2]
+        w.panes['disk'].select_uuid(source.uuid)
+        dlg = mock.Mock()
+        dlg.exec.return_value = 1
+        dlg.command = vboxfront.mediumio_cat_args('disk', source.uuid,
+                                                output=target.location)
+        with mock.patch.object(window_module, 'ContentsDialog', return_value=dlg), \
+             mock.patch.object(QMessageBox, 'warning') as warning, \
+             mock.patch.object(w.runner, 'run') as run:
+            w.show_contents_selected()
+        run.assert_not_called()
+        warning.assert_called_once()
+
+    def test_declared_stream_size_must_match_the_full_input(self):
+        import io
+        w = self.make_window()
+        for actual, expected_success in ((64, False), (128, False), (100, True)):
+            with self.subTest(actual=actual):
+                stream = io.BytesIO(b'x' * actual)
+                codes = []
+                callback = codes.append
+                w.runner.finished.connect(callback)
+                w.runner.run(['modifymedium', 'disk', 'uuid', '--compact'],
+                             stdin_stream=stream, stdin_total=100)
+                self.assertTrue(wait_until(lambda: bool(codes)))
+                w.runner.finished.disconnect(callback)
+                self.assertEqual(codes[0] == 0, expected_success)
+                self.assertTrue(stream.closed)
+                self.assertTrue(wait_until(lambda: not w._refreshing))
+
+    def test_preparation_failure_drops_the_queue_without_running(self):
+        w = self.make_window()
+        with mock.patch.object(w.runner, 'run') as run:
+            started = w._run_queue([(['first'], None, None), (['second'], None, None)],
+                                   before_each=lambda args: False)
+        self.assertFalse(started)
+        run.assert_not_called()
+        self.assertEqual(w._cmd_queue, [])
+        self.assertIsNone(w._followup)
+
+    def test_quitting_a_running_batch_discards_queued_commands(self):
+        w = self.make_window()
+        w._run_queue([(['hang'], None, None),
+                      (['modifymedium', 'disk', 'should-not-run', '--compact'], None, None)])
+        self.assertTrue(wait_until(lambda: w.runner.is_busy()))
+        with mock.patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes):
+            w.close()
+        self.assertEqual(w._cmd_queue, [])
+        self.assertTrue(wait_until(lambda: not w.runner.is_busy() and not w._refreshing))
+        self.assertFalse(any('should-not-run' in c for c in self.calls_log()))

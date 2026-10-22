@@ -31,6 +31,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY vboxfront.py ./
+COPY vboxfront_app/ ./vboxfront_app/
 COPY tests/ ./tests/
 COPY e2e/ ./e2e/
 
