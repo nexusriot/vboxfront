@@ -1,6 +1,6 @@
 # Review — 2026-10-22
 
-Applies to source version **1.10.0**.
+Applies to source version **1.10.0** (1.11.0 features are covered by their own tests).
 
 Reviewed the application, command construction, destructive file workflows,
 process lifecycle, compressed imports, test fixtures, build scripts, CI and

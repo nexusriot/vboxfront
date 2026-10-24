@@ -14,6 +14,12 @@ APP_VERSION = re.search(
 ).group(1)
 
 datas, binaries, hiddenimports = collect_all("PyQt6")
+datas += [("vboxfront_app/icon.svg", "vboxfront_app")]
+
+# scripts/render_icon.py rasterises icon.svg; PyInstaller turns the PNG into
+# .ico/.icns itself when Pillow is installed. Without it, builds go iconless.
+ICON_PNG = pathlib.Path("build/icon.png")
+ICON = str(ICON_PNG) if ICON_PNG.exists() and platform.system() in ("Windows", "Darwin") else None
 
 a = Analysis(
     ["vboxfront.py"],
@@ -62,8 +68,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon="icon.ico",     # uncomment and set path for Windows
-    # icon="icon.icns",    # uncomment and set path for macOS
+    icon=ICON,
 )
 
 # macOS .app bundle
@@ -71,7 +76,7 @@ if platform.system() == "Darwin":
     app = BUNDLE(
         exe,
         name="vboxfront.app",
-        icon=None,              # set to "icon.icns" if you have one
+        icon=ICON,
         bundle_identifier="com.example.vboxfront",
         info_plist={
             "NSHighResolutionCapable": True,

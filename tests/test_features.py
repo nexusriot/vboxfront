@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -14,13 +15,17 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 from vboxfront_app.recovery import OperationJournal
 from vboxfront_app.batches import BatchReport
 from vboxfront_app.trash import TrashStore
+from vboxfront_app.watcher import RegistryWatcher, virtualbox_home
 from vboxfront_app.models import TrashedFile
-from vboxfront_app.persistence import get_settings, move_to_trash, load_library
+from vboxfront_app.persistence import (
+    add_library_path, get_settings, load_library, move_to_trash, remove_library_path, save_library,
+)
 from vboxfront_app.library_views import SavedFilterStore, storage_slots, StorageSlot
 from vboxfront_app.snapshots import compare_registry, load_snapshot
 from vboxfront_app.measurement import ArchiveMeasureTask, MeasurementCache, source_stamp
 from vboxfront_app.disk_dialogs import ImportCompressedDialog
-from vboxfront_app.feature_dialogs import TrashManagerDialog, RecoveryDialog, BatchResultsDialog, VMStorageDialog
+from vboxfront_app.reports import space_report
+from vboxfront_app.feature_dialogs import SpaceReportDialog, TrashManagerDialog, RecoveryDialog, BatchResultsDialog, VMStorageDialog
 from tests.test_window import FakeVBoxManageTest, wait_until
 
 
@@ -156,6 +161,128 @@ class RecoveryServiceTest(unittest.TestCase):
         self.assertFalse(self.journal.unresolved())
 
 
+class TrashPurgeTest(unittest.TestCase):
+    DAY = 86400
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="vboxfront-purge-"))
+        self.store = TrashStore()
+        self.store.save([])
+
+    def entry(self, name, size, when):
+        path = self.root / name
+        path.write_bytes(b"x" * size)
+        return TrashedFile("disk", str(self.root / ("orig-" + name)), str(path), when)
+
+    def test_off_by_default_purges_nothing(self):
+        old = self.entry("a", 10, 1.0)
+        self.store.save([[old], [self.entry("b", 10, 2.0)]])
+        self.assertEqual(self.store.purge(0, 0), ([], []))
+        self.assertTrue(os.path.exists(old.trashed))
+
+    def test_age_rule_deletes_old_files_but_never_the_newest_batch(self):
+        now = 100 * self.DAY
+        old = self.entry("old", 10, now - 40 * self.DAY)
+        newest = self.entry("newest", 10, now - 50 * self.DAY)
+        self.store.save([[old], [newest]])
+        deleted, errors = self.store.purge(30, 0, now=now)
+        self.assertEqual((deleted, errors), ([old], []))
+        self.assertFalse(os.path.exists(old.trashed))
+        self.assertTrue(os.path.exists(newest.trashed))
+        self.assertEqual(self.store.load(), [[newest]])
+
+    def test_size_cap_removes_oldest_first(self):
+        a = self.entry("a", 8192, 1.0)
+        b = self.entry("b", 8192, 2.0)
+        c = self.entry("c", 8192, 3.0)
+        cap = os.lstat(c.trashed).st_blocks * 512 * 2
+        self.store.save([[a], [b], [c]])
+        deleted, _ = self.store.purge(0, cap)
+        self.assertEqual(deleted, [a])
+        self.assertEqual(self.store.load(), [[b], [c]])
+
+    def test_legacy_entries_without_a_timestamp_load_and_age_by_ctime(self):
+        get_settings().setValue(TrashStore.KEY, json.dumps(
+            [[{"kind": "disk", "original": "/x", "trashed": str(self.root / "missing")}]]))
+        self.assertEqual(self.store.load()[0][0].trashed_at, 0.0)
+        legacy = self.entry("legacy", 10, 0.0)
+        self.store.save([[legacy], [self.entry("n", 10, 0.0)]])
+        self.assertEqual(self.store.purge_candidates(1, 0, now=time.time() + 2 * self.DAY), [legacy])
+
+
+class RegistryWatcherTest(unittest.TestCase):
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp(prefix="vboxfront-vbhome-"))
+        self.xml = self.home / "VirtualBox.xml"
+        self.xml.write_text("<v1/>")
+        self.watcher = RegistryWatcher(str(self.xml), delay_ms=30)
+        self.hits = []
+        self.watcher.changed.connect(lambda: self.hits.append(1))
+
+    def replace_file(self, text):
+        # VBoxSVC's own save pattern: a new file renamed over the old one.
+        tmp = self.home / "VirtualBox.xml-tmp"
+        tmp.write_text(text)
+        os.replace(tmp, self.xml)
+
+    def test_atomic_saves_are_noticed_every_time(self):
+        self.watcher.set_enabled(True)
+        self.replace_file("<v2/>")
+        self.assertTrue(wait_until(lambda: len(self.hits) == 1))
+        self.replace_file("<v3 longer/>")
+        self.assertTrue(wait_until(lambda: len(self.hits) == 2))
+
+    def test_unrelated_files_and_disabled_watch_are_ignored(self):
+        self.watcher.set_enabled(True)
+        (self.home / "VBoxSVC.log").write_text("noise")
+        self.assertFalse(wait_until(lambda: self.hits, timeout=0.4))
+        self.watcher.set_enabled(False)
+        self.replace_file("<v9/>")
+        self.assertFalse(wait_until(lambda: self.hits, timeout=0.4))
+
+    def test_vbox_user_home_wins(self):
+        with mock.patch.dict(os.environ, {"VBOX_USER_HOME": str(self.home)}):
+            self.assertEqual(virtualbox_home(), str(self.home))
+
+
+class LibraryPathMatchingTest(unittest.TestCase):
+    # VBoxManage reports Location in its own spelling; the library must still
+    # recognise the entry, or Remove/Move leave it behind to be re-imported.
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="vboxfront-lib-"))
+        self.real = self.root / "real"
+        self.real.mkdir()
+        self.disk = self.real / "a.vdi"
+        self.disk.write_bytes(b"x")
+        self.link = self.root / "link"
+        self.link.symlink_to(self.real)
+        save_library("disk", [])
+
+    def test_remove_through_a_symlink(self):
+        add_library_path("disk", str(self.link / "a.vdi"))
+        self.assertTrue(remove_library_path("disk", str(self.disk)))
+        self.assertEqual(load_library("disk"), [])
+
+    def test_remove_with_dotdot_after_the_file_is_gone(self):
+        add_library_path("disk", str(self.disk))
+        self.disk.unlink()
+        self.assertTrue(remove_library_path("disk", str(self.real / ".." / "real" / "a.vdi")))
+        self.assertEqual(load_library("disk"), [])
+
+    def test_add_does_not_duplicate_another_spelling(self):
+        add_library_path("disk", str(self.disk))
+        add_library_path("disk", str(self.link / "a.vdi"))
+        add_library_path("disk", str(self.real) + "/./a.vdi")
+        self.assertEqual(load_library("disk"), [str(self.disk)])
+
+    def test_remove_leaves_other_files_and_reports_a_miss(self):
+        other = str(self.real / "b.vdi")
+        save_library("disk", [str(self.disk), other])
+        self.assertFalse(remove_library_path("disk", str(self.real / "c.vdi")))
+        self.assertTrue(remove_library_path("disk", str(self.link / "a.vdi")))
+        self.assertEqual(load_library("disk"), [other])
+
+
 class SnapshotServiceTest(unittest.TestCase):
     def test_added_missing_moved_and_other_changes(self):
         before = {'disk': [{'uuid': 'a', 'location': '/old'}, {'uuid': 'gone'}, {'uuid': 'c', 'type': 'normal'}]}
@@ -178,6 +305,37 @@ class SnapshotServiceTest(unittest.TestCase):
 
 
 class FeatureIntegrationTest(FakeVBoxManageTest):
+    def test_registry_change_refreshes_only_when_idle_and_not_ours(self):
+        w = self.make_window()
+        with mock.patch.object(w, 'refresh_media') as refresh:
+            w._registry_file_changed()  # right after our own refresh
+            refresh.assert_not_called()
+            w._watch_quiet_until = 0.0
+            with mock.patch.object(w.runner, 'is_busy', return_value=True):
+                w._registry_file_changed()
+            refresh.assert_not_called()
+            w._registry_file_changed()
+            refresh.assert_called_once()
+
+    def test_auto_refresh_toggle_persists(self):
+        w = self.make_window()
+        w.act_auto_refresh.setChecked(False)
+        self.assertFalse(get_settings().value('ui/auto_refresh', True, bool))
+        self.assertFalse(w.registry_watcher.is_enabled())
+        w.act_auto_refresh.setChecked(True)
+        self.assertTrue(w.registry_watcher.is_enabled())
+
+    def test_space_report_compacts_the_chosen_candidates(self):
+        w = self.make_window()
+        dlg = SpaceReportDialog(space_report(w.media), w)
+        top = next(dlg.tree.topLevelItem(i) for i in range(dlg.tree.topLevelItemCount())
+                   if dlg.tree.topLevelItem(i).text(0) == 'Compact candidates')
+        self.assertFalse(dlg.compact_btn.isEnabled())
+        top.child(0).setSelected(True)
+        self.assertTrue(dlg.compact_btn.isEnabled())
+        dlg.compact_selected()
+        self.assertEqual(len(dlg.compact_uuids), 1)
+
     def test_saved_filters_persist_and_apply_to_the_existing_filter(self):
         w = self.make_window()
         store = SavedFilterStore()

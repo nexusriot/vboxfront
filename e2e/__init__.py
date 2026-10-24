@@ -14,3 +14,4 @@ import tempfile
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("XDG_CONFIG_HOME", tempfile.mkdtemp(prefix="vboxfront-e2e-cfg-"))
 os.environ.setdefault("XDG_DATA_HOME", tempfile.mkdtemp(prefix="vboxfront-e2e-data-"))
+os.environ.setdefault("VBOX_USER_HOME", tempfile.mkdtemp(prefix="vboxfront-e2e-vbox-"))

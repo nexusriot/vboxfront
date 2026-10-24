@@ -9,7 +9,7 @@ import re
 import shutil
 
 from .constants import TRASH_DIR_NAME
-from .domain import export_rows
+from .domain import export_rows, same_file
 from .models import MediumRecord, TrashedFile
 
 
@@ -67,17 +67,22 @@ def save_library(kind: str, paths: list[str]) -> None:
 
 
 def add_library_path(kind: str, path: str) -> None:
+    # Matched by file, not spelling: VBoxManage may report a Location with
+    # symlinks or ".." resolved differently from the path that was stored.
     paths = load_library(kind)
-    if path not in paths:
+    if not any(same_file(p, path) for p in paths):
         paths.append(path)
         save_library(kind, paths)
 
 
-def remove_library_path(kind: str, path: str) -> None:
+def remove_library_path(kind: str, path: str) -> bool:
+    """Drop every entry naming the same file as `path`; True if any went."""
     paths = load_library(kind)
-    if path in paths:
-        paths.remove(path)
-        save_library(kind, paths)
+    kept = [p for p in paths if not same_file(p, path)]
+    if len(kept) == len(paths):
+        return False
+    save_library(kind, kept)
+    return True
 
 
 def plan_mode() -> bool:
@@ -97,6 +102,16 @@ def trash_enabled() -> bool:
 def trash_root() -> str:
     """The configured trash folder, or "" while it follows each image."""
     return get_settings().value("trash/dir", "", str)
+
+
+def trash_purge_days() -> int:
+    """Purge trashed files older than this many days; 0 never does."""
+    return max(0, get_settings().value("trash/purge_days", 0, int))
+
+
+def trash_purge_gb() -> int:
+    """Keep the trash under this many GB, oldest out first; 0 for no cap."""
+    return max(0, get_settings().value("trash/purge_gb", 0, int))
 
 
 def user_trash_dir() -> str:

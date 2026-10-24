@@ -5,17 +5,22 @@ import shlex
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
+    QApplication,
     QDialog,
     QVBoxLayout,
     QHBoxLayout,
     QTreeWidget,
     QTreeWidgetItem,
     QLabel,
+    QProgressBar,
     QPushButton,
     QMessageBox,
     QInputDialog,
 )
-from .domain import format_bytes, rerun_blocker, is_destructive_command
+from .domain import format_bytes, format_mbytes, rerun_blocker, is_destructive_command
+from .reports import space_report_text
+from .verify import VerifyTask, verdict
+from .theme import color_css, error_color
 
 
 def action_row(layout, actions):
@@ -276,3 +281,186 @@ class VMStorageDialog(QDialog):
                 f'Detach {slot.medium} from {slot.vm_name}, {slot.controller}, port {slot.port}, device {slot.device}?') == QMessageBox.StandardButton.Yes:
             self.requested = ('detach', slot, '', '')
             self.accept()
+
+
+class SpaceReportDialog(QDialog):
+    """Where the disk space goes, from the listing already on screen."""
+
+    def __init__(self, sections, parent=None):
+        super().__init__(parent)
+        self.sections = sections
+        self.compact_uuids: list[str] = []
+        self.setWindowTitle('Disk space report')
+        self.resize(820, 520)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel('Sizes are allocated space on disk as VirtualBox reports it. '
+                                'Nothing was run to produce this report.'))
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(['Item', 'On disk', 'Images', 'Note'])
+        self.tree.setSelectionMode(self.tree.SelectionMode.ExtendedSelection)
+        for section in sections:
+            top = QTreeWidgetItem([section.title, format_mbytes(section.total_mb), '', section.note])
+            font = top.font(0)
+            font.setBold(True)
+            top.setFont(0, font)
+            for row in section.rows:
+                child = QTreeWidgetItem([row.label, format_mbytes(row.mb),
+                                         str(row.count) if row.count else '', row.note])
+                child.setData(0, Qt.ItemDataRole.UserRole, (section.title, row.uuids))
+                child.setToolTip(0, row.label)
+                top.addChild(child)
+            self.tree.addTopLevelItem(top)
+            top.setExpanded(section.title != 'By folder' or len(section.rows) <= 8)
+        self.tree.resizeColumnToContents(0)
+        self.tree.itemSelectionChanged.connect(self._sync)
+        layout.addWidget(self.tree)
+        row = QHBoxLayout()
+        copy = QPushButton('Copy as text')
+        copy.clicked.connect(self.copy_text)
+        self.compact_btn = QPushButton('Compact selected candidates…')
+        self.compact_btn.clicked.connect(self.compact_selected)
+        close = QPushButton('Close')
+        close.clicked.connect(self.reject)
+        for button in (copy, self.compact_btn, close):
+            row.addWidget(button)
+        layout.addLayout(row)
+        self._sync()
+
+    def _selected_candidates(self) -> list[str]:
+        uuids = []
+        for item in self.tree.selectedItems():
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data and data[0] == 'Compact candidates':
+                uuids += data[1]
+        return uuids
+
+    def _sync(self):
+        self.compact_btn.setEnabled(bool(self._selected_candidates()))
+
+    def copy_text(self):
+        QApplication.clipboard().setText(space_report_text(self.sections))
+
+    def compact_selected(self):
+        self.compact_uuids = self._selected_candidates()
+        if self.compact_uuids:
+            self.accept()
+
+
+class VerifyDialog(QDialog):
+    """Hash two images' guest-visible contents and say whether they match."""
+
+    def __init__(self, vbm: str, sources, parent=None, autostart: bool = True):
+        super().__init__(parent)
+        self.setWindowTitle('Compare contents')
+        self.resize(720, 260)
+        self.sources = sources
+        self.results = None
+        self.identical = None
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel('Reads each image end to end as the guest sees it and '
+                                'compares SHA-256 hashes. Large disks take a while.'))
+        self.bars = []
+        for source in sources:
+            label = QLabel(f'<b>{source.label}</b><br><tt>{source.describe()}</tt>')
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            layout.addWidget(label)
+            layout.addWidget(bar)
+            self.bars.append(bar)
+        self.verdict = QLabel('')
+        self.verdict.setWordWrap(True)
+        self.verdict.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.verdict)
+        row = QHBoxLayout()
+        self.cancel_btn = QPushButton('Cancel')
+        self.cancel_btn.clicked.connect(self.cancel)
+        self.close_btn = QPushButton('Close')
+        self.close_btn.clicked.connect(self.accept)
+        self.close_btn.setEnabled(False)
+        row.addStretch(1)
+        row.addWidget(self.cancel_btn)
+        row.addWidget(self.close_btn)
+        layout.addLayout(row)
+        self.task = VerifyTask(vbm, sources, self)
+        self.task.progress.connect(self._progress)
+        self.task.done.connect(self._done)
+        if autostart:
+            self.task.start()
+
+    def _progress(self, index: int, pct: int):
+        bar = self.bars[index]
+        if pct < 0:
+            bar.setRange(0, 0)
+        else:
+            bar.setRange(0, 100)
+            bar.setValue(pct)
+
+    def _done(self, results):
+        self.results = results
+        self.identical, text = verdict(results)
+        for bar, result in zip(self.bars, results):
+            bar.setRange(0, 100)
+            bar.setValue(100 if not result.error else 0)
+        self.verdict.setText(text)
+        self.verdict.setStyleSheet('' if self.identical else color_css(error_color()))
+        self.cancel_btn.setEnabled(False)
+        self.close_btn.setEnabled(True)
+
+    def cancel(self):
+        self.task.cancel()
+
+    def done(self, result):
+        if self.task.isRunning():
+            self.task.cancel()
+            self.task.wait()
+        super().done(result)
+
+
+class GoldenImageDialog(QDialog):
+    """Pick the VMs that should each boot from their own child of one base."""
+
+    def __init__(self, medium_name: str, needs_type: bool, rows, parent=None):
+        """rows: (vm name, vm uuid, (controller, port, device) | None, running)."""
+        super().__init__(parent)
+        self.setWindowTitle('Golden image')
+        self.resize(720, 420)
+        self.chosen = []
+        layout = QVBoxLayout(self)
+        steps = ('<b>{0}</b> becomes <i>multiattach</i>, then is attached to each VM '
+                 'ticked below.' if needs_type else '<b>{0}</b> is already multiattach; it is '
+                 'attached to each VM ticked below.').format(medium_name)
+        text = QLabel(steps + ' VirtualBox gives every VM its own differencing image on '
+                      'top of it, so the VMs share the base and never write to it.')
+        text.setWordWrap(True)
+        layout.addWidget(text)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(['VM', 'Attach at', 'Note'])
+        for name, uuid, slot, running in rows:
+            where = f'{slot[0]} port {slot[1]} device {slot[2]}' if slot else ''
+            note = ('running — power it off first' if running
+                    else '' if slot else 'no free slot on a disk controller')
+            item = QTreeWidgetItem([name, where, note])
+            item.setData(0, Qt.ItemDataRole.UserRole, (uuid, name, slot))
+            if running or not slot:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+            else:
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+            self.tree.addTopLevelItem(item)
+        self.tree.resizeColumnToContents(0)
+        layout.addWidget(self.tree)
+        action_row(layout, [('Attach', self._ok), ('Cancel', self.reject)])
+
+    def _ok(self):
+        self.chosen = [
+            self.tree.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole)
+            for i in range(self.tree.topLevelItemCount())
+            if self.tree.topLevelItem(i).checkState(0) == Qt.CheckState.Checked
+        ]
+        if not self.chosen:
+            QMessageBox.information(self, 'Golden image', 'Tick at least one VM.')
+            return
+        self.accept()

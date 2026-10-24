@@ -43,10 +43,12 @@ trap 'rm -rf "$STAGE"' EXIT
 install -d "$STAGE/DEBIAN"
 install -d "$STAGE/usr/bin"
 install -d "$STAGE/usr/share/applications"
+install -d "$STAGE/usr/share/icons/hicolor/scalable/apps"
 install -d "$STAGE/usr/share/doc/$APP"
 
 install -m 0755 "$BIN"                              "$STAGE/usr/bin/$APP"
 install -m 0644 "$ROOT/scripts/deb/$APP.desktop"      "$STAGE/usr/share/applications/$APP.desktop"
+install -m 0644 "$ROOT/vboxfront_app/icon.svg"        "$STAGE/usr/share/icons/hicolor/scalable/apps/$APP.svg"
 
 # changelog (gzipped, as required by lintian)
 if [ -f "$ROOT/scripts/deb/changelog" ]; then

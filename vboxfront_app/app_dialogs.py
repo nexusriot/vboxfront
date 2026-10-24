@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
 )
 import os
@@ -44,6 +45,8 @@ from .persistence import (
     remember_folder,
     save_library,
     trash_enabled,
+    trash_purge_days,
+    trash_purge_gb,
     trash_root,
 )
 from .theme import color_css, error_color, muted_color, warning_color
@@ -283,11 +286,32 @@ class SettingsDialog(QDialog):
                 "<i>Left empty the trash follows each image, so the delete is "
                 "a rename inside one filesystem and costs nothing however "
                 "large the disk is — a folder on another drive means a "
-                "full copy. Nothing is ever emptied automatically; "
-                "<b>Media → Undo delete</b> puts back the last delete of "
-                "this session, older files wait in the folder.</i>"
+                "full copy. <b>Media → Undo delete</b> puts back the last "
+                "delete; older files wait in the folder.</i>"
             )
         )
+        purge_row = QHBoxLayout()
+        self.purge_days = QSpinBox()
+        self.purge_days.setRange(0, 3650)
+        self.purge_days.setSpecialValueText("never")
+        self.purge_days.setSuffix(" days")
+        self.purge_days.setValue(trash_purge_days())
+        self.purge_gb = QSpinBox()
+        self.purge_gb.setRange(0, 100000)
+        self.purge_gb.setSpecialValueText("no limit")
+        self.purge_gb.setSuffix(" GB")
+        self.purge_gb.setValue(trash_purge_gb())
+        purge_row.addWidget(QLabel("older than"))
+        purge_row.addWidget(self.purge_days)
+        purge_row.addWidget(QLabel("or beyond"))
+        purge_row.addWidget(self.purge_gb)
+        purge_row.addStretch(1)
+        layout.addRow("Purge trash:", purge_row)
+        layout.addRow(QLabel(
+            "<i>Off unless set. Applied at start-up and after each delete, "
+            "oldest files first; the most recent delete is always kept so "
+            "Undo delete still works.</i>"
+        ))
         self.trash_check.toggled.connect(self._sync_trash_row)
         self._sync_trash_row()
 
@@ -335,7 +359,10 @@ class SettingsDialog(QDialog):
             self.trash_edit.setText(path)
 
     def _sync_trash_row(self):
-        self.trash_edit.setEnabled(self.trash_check.isChecked())
+        on = self.trash_check.isChecked()
+        self.trash_edit.setEnabled(on)
+        self.purge_days.setEnabled(on)
+        self.purge_gb.setEnabled(on)
 
     def _remove_selected(self):
         for item in self.library_list.selectedItems():
@@ -347,6 +374,8 @@ class SettingsDialog(QDialog):
         settings.setValue("image_folder", self.images_edit.text().strip())
         settings.setValue("trash/enabled", self.trash_check.isChecked())
         settings.setValue("trash/dir", self.trash_edit.text().strip())
+        settings.setValue("trash/purge_days", self.purge_days.value())
+        settings.setValue("trash/purge_gb", self.purge_gb.value())
         keep: dict[str, list[str]] = {kind: [] for kind in KINDS}
         for i in range(self.library_list.count()):
             kind, path = self.library_list.item(i).data(Qt.ItemDataRole.UserRole)

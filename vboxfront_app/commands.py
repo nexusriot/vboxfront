@@ -248,6 +248,30 @@ def setlocation_args(kind: str, uuid: str, path: str) -> list[str]:
     return ["modifymedium", kind, uuid, "--setlocation", path]
 
 
+def properties_undo_args(kind: str, medium, new_type: str | None,
+                         new_description: str | None,
+                         new_autoreset: bool | None) -> list[list[str]]:
+    """The calls that put back what a Properties edit is about to change.
+
+    Built from the listing *before* the edit, and only for what the edit
+    actually changes. Reverse order: auto-reset only applies to an immutable
+    disk, so it has to be restored while the disk is still immutable.
+    """
+    commands: list[list[str]] = []
+    old_reset = medium.auto_reset.lower() == "on"
+    if new_autoreset is not None and kind == "disk" and new_autoreset != old_reset:
+        commands.append(autoreset_args(medium.uuid, old_reset))
+    old_type = medium.medium_type.split(" ")[0] if medium.medium_type else ""
+    restore_type = old_type if new_type and old_type and new_type != old_type else None
+    restore_desc = (medium.description
+                    if new_description is not None and new_description != medium.description
+                    else None)
+    edit = properties_args(kind, medium.uuid, restore_type, restore_desc)
+    if edit:
+        commands.append(edit)
+    return commands
+
+
 def repairhd_args(path: str, fmt: str = "", dry_run: bool = False) -> list[str]:
     args = ["internalcommands", "repairhd"]
     if dry_run:

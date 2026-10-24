@@ -111,12 +111,11 @@ The original trash and session undo arrived in 1.8.0.
 - [x] **S** — Attach dialog: the device spin now comes from
       `storagecontrollertype<N>` *(1.6.0)* — only IDE (PIIX3/PIIX4/ICH6) and
       the floppy controller (I82078) address two devices per port.
-- [ ] **S** — The media library matches paths literally, so a `Location:`
+- [x] **S** — The media library matched paths literally, so a `Location:`
       that VBoxManage reports differently from the stored path would leave
       Remove/Move unable to prune the entry and the medium would return on the
-      next refresh. Not reproducible on 7.2.12 (`RTPathAbs` keeps symlinks and
-      QFileDialog hands over clean absolute paths) — match on `same_file()` if
-      it ever shows up.
+      next refresh. Adding and removing now match on `same_file()` (symlinks,
+      `..`, and files already gone), so no second spelling is stored either.
 
 ## Delivered in 1.4.0
 
@@ -212,6 +211,20 @@ The original feature proposals are delivered. Registry snapshots live in the
 per-user data directory. Long operations use a window alert; native desktop
 notifications remain a possible enhancement.
 
+## Delivered in 1.11.0 (2026-10-24)
+
+- [x] Compare contents (`mediumio cat` hashes), and verify after convert/flatten.
+- [x] Flatten a differencing chain into one standalone image.
+- [x] Disk space report: by VM, folder and chain, trash, compact candidates.
+- [x] Auto-refresh when VirtualBox.xml changes outside the window.
+- [x] Headless CLI: `list`, `health`, `space`, `compact-all`, `verify`.
+- [x] Read-only browsing through `vboximg-mount -g`.
+- [x] Golden image: multiattach base attached to several VMs.
+- [x] Opt-in trash purge by age or size.
+- [x] Undo last change for Move, Resolve re-point and Properties.
+- [x] Library entries match by file, not spelling.
+- [x] Own icon; Windows and macOS builds in CI.
+
 ## Delivered in 1.10.0 (2026-10-22)
 
 - [x] Recoverable overwrite targets for file-producing clone/import/export.
@@ -229,9 +242,11 @@ the complete batch report lasts for the window session).
 
 ## Packaging / project
 
-- [ ] **S** — Ship an own icon (the `.desktop` currently borrows
-      `Icon=virtualbox`); wire it into PyInstaller spec (ico/icns) too.
-- [ ] **M** — CI matrix: Windows and macOS PyInstaller builds (spec already
+- [x] **S** — Ship an own icon (`vboxfront_app/icon.svg`): window, `.desktop`,
+      `.deb` hicolor theme, and PyInstaller ico/icns via
+      `scripts/render_icon.py` *(1.11.0)*.
+- [x] **M** — CI matrix: Windows and macOS PyInstaller builds *(1.11.0;
+      not yet seen green — first run pending)* (spec already
       has the Darwin BUNDLE branch; VBoxManage default paths differ —
       the Settings override covers it).
 - [ ] **S** — Lintian-clean pass over the `.deb` (changelog is gzipped and

@@ -32,6 +32,7 @@ from .commands import (
     mediumio_cat_args,
     mediumproperty_args,
     properties_args,
+    properties_undo_args,
     repairhd_args,
     sethdparentuuid_args,
     sethduuid_args,
@@ -648,15 +649,22 @@ class PropertiesDialog(QDialog):
 
     def commands(self, kind: str) -> list[list[str]]:
         """Every call the edit needs, for one medium or for the selection."""
+        return [c for medium in self._media for c in self.commands_for(kind, medium)]
+
+    def commands_for(self, kind: str, medium: MediumRecord) -> list[list[str]]:
+        """The calls the edit needs for one medium of the selection."""
         commands = []
-        for medium in self._media:
-            edit = properties_args(kind, medium.uuid, self.new_type,
-                                   self.new_description)
-            if edit:
-                commands.append(edit)
-            if self.new_autoreset is not None and kind == "disk":
-                commands.append(autoreset_args(medium.uuid, self.new_autoreset))
+        edit = properties_args(kind, medium.uuid, self.new_type,
+                               self.new_description)
+        if edit:
+            commands.append(edit)
+        if self.new_autoreset is not None and kind == "disk":
+            commands.append(autoreset_args(medium.uuid, self.new_autoreset))
         return commands
+
+    def undo_commands_for(self, kind: str, medium: MediumRecord) -> list[list[str]]:
+        return properties_undo_args(kind, medium, self.new_type, self.new_description,
+                                    self.new_autoreset)
 
 
 class EncryptDialog(QDialog):

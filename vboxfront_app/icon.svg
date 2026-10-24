@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <title>VBoxFront</title>
+  <!-- A stack of three disk platters: the base image and its children. -->
+  <rect x="16" y="16" width="224" height="224" rx="48" fill="#1f4e79"/>
+  <g fill="none" stroke-width="10">
+    <ellipse cx="128" cy="172" rx="72" ry="24" fill="#2e75b6" stroke="#9dc3e6"/>
+    <path d="M56 148v24M200 148v24" stroke="#9dc3e6"/>
+    <ellipse cx="128" cy="132" rx="72" ry="24" fill="#2e75b6" stroke="#9dc3e6"/>
+    <path d="M56 108v24M200 108v24" stroke="#9dc3e6"/>
+    <ellipse cx="128" cy="92" rx="72" ry="24" fill="#5b9bd5" stroke="#deebf7"/>
+  </g>
+  <ellipse cx="128" cy="92" rx="16" ry="5" fill="#deebf7"/>
+</svg>

@@ -135,6 +135,54 @@ def write_image(path: str, size_mb: int, fixed: bool = False,
     stamp_uuid(path, uuid)
 
 
+STAMP_LEN = len(IMAGE_MAGIC) + 36
+
+
+def file_chunks(path: str, capacity: int, chunk: int):
+    """An image file's data region, the stamp masked, padded to capacity.
+
+    Real VirtualBox keeps the UUID in the image header, outside the data a
+    guest sees, so `mediumio cat` of a medium and of its clone agree. The fake
+    keeps it in the first bytes of the file; masking it gives the same answer.
+    """
+    with open(path, "rb") as handle:
+        pos = 0
+        while pos < capacity:
+            want = min(chunk, capacity - pos)
+            data = handle.read(want).ljust(want, b"\0")
+            if pos == 0 and data.startswith(IMAGE_MAGIC):
+                data = b"\0" * STAMP_LEN + data[STAMP_LEN:]
+            pos += len(data)
+            yield data
+
+
+def guest_chunks(state: dict, medium: dict, chunk: int = 1024 * 1024):
+    """What a guest reads: a differencing image's blocks over its parent's.
+
+    Block-granular like VDI: a chunk the child never wrote (all zero here)
+    reads through to the parent.
+    """
+    capacity = medium["capacity_mb"] * 1024 * 1024
+    own = file_chunks(medium["location"], capacity, chunk)
+    parent = find(state, medium.get("parent") or "")
+    if parent is None:
+        yield from own
+        return
+    for mine, theirs in zip(own, guest_chunks(state, parent, chunk)):
+        yield theirs if mine.count(0) == len(mine) else mine
+
+
+def copy_guest_data(state: dict, source: dict, target: str) -> None:
+    """Fill a fresh image with the source's guest data, sparsely."""
+    with open(target, "r+b") as out:
+        pos = 0
+        for data in guest_chunks(state, source):
+            if data.count(0) != len(data):
+                out.seek(pos)
+                out.write(data)
+            pos += len(data)
+
+
 def in_use_lines(state: dict, medium: dict) -> list[str]:
     lines = []
     for vm in state["vms"]:
@@ -397,6 +445,11 @@ def cmd_modifymedium(state: dict, args: list[str]) -> int:
     if new_type:
         if medium.get("parent"):
             return fail("Cannot change the type of a differencing medium")
+        users = [v["name"] for v in state["vms"]
+                 if any(a.get("uuid") == medium["uuid"] for a in v.get("attachments", []))]
+        if users and new_type != medium.get("type"):
+            return fail(f"Cannot change the type of medium '{medium['location']}' because it "
+                        f"is attached to {len(users)} virtual machines (VBOX_E_OBJECT_IN_USE)")
         medium["type"] = new_type
     description = opt(rest, "--description")
     if description is not None:
@@ -457,10 +510,12 @@ def cmd_clonemedium(state: dict, args: list[str]) -> int:
         # A flat image: the whole capacity, and nothing registered — RAW
         # cannot be a managed medium, which is why it is an export only.
         write_image(target, source["capacity_mb"], fixed=True)
+        copy_guest_data(state, source, target)
         print("0%...50%...100%")
         print("Clone medium created in format 'RAW'.")
         return 0
     write_image(target, source["capacity_mb"], fixed="fixed" in variant.lower())
+    copy_guest_data(state, source, target)
     clone = register(state, target, kind=source["kind"], fmt=fmt,
                      capacity_mb=source["capacity_mb"],
                      variant="fixed default" if "fixed" in variant.lower()
@@ -546,6 +601,14 @@ def cmd_storageattach(state: dict, args: list[str]) -> int:
     ]
     if token not in (None, "none"):
         medium = find(state, token)
+        if medium is not None and medium.get("type") == "multiattach":
+            # What VirtualBox does with a multiattach medium: the VM gets a
+            # differencing image of its own in its folder, never the base.
+            folder = os.path.join(os.path.dirname(medium["location"]), vm["name"], "Snapshots")
+            child_path = os.path.join(folder, "{" + str(uuidlib.uuid4()) + "}.vdi")
+            write_image(child_path, 0)
+            medium = register(state, child_path, kind=medium["kind"], fmt="VDI",
+                              capacity_mb=medium["capacity_mb"], parent=medium["uuid"])
         slot["uuid"] = medium["uuid"] if medium else ""
         slot["location"] = medium["location"] if medium else token
         vm["attachments"].append(slot)
@@ -609,12 +672,20 @@ def cmd_mediumio(state: dict, args: list[str]) -> int:
         return 0
     if "cat" in args:
         offset = int(opt(args, "--offset") or 0)
-        size = int(opt(args, "--size") or 512)
+        capacity = medium["capacity_mb"] * 1024 * 1024
         output = opt(args, "--output")
+        size_opt = opt(args, "--size")
+        if size_opt is None and output == "-" and "--hex" not in args:
+            # The whole medium, streamed: what a verification reads.
+            try:
+                for data in guest_chunks(state, medium):
+                    sys.stdout.buffer.write(data)
+            except OSError as exc:
+                return fail(str(exc))
+            return 0
+        size = int(size_opt or 512)
         try:
-            with open(medium["location"], "rb") as handle:
-                handle.seek(offset)
-                data = handle.read(size)
+            data = b"".join(guest_chunks(state, medium))[offset:offset + size]
         except OSError as exc:
             return fail(str(exc))
         data = data.ljust(size, b"\0")

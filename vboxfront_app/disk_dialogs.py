@@ -436,9 +436,18 @@ class ConvertDialog(QDialog):
         self.variant.currentTextChanged.connect(self._update_space)
         self._update_space()
 
+        # Reads both images end to end afterwards and compares hashes of what
+        # the guest sees — the only way to show a VDI and a VMDK agree.
+        self.verify_check = QCheckBox("Verify contents afterwards (reads both images in full)")
+        if disk.encryption not in ("", "disabled"):
+            self.verify_check.setEnabled(False)
+            self.verify_check.setToolTip("Encrypted media cannot be read without their password")
+        layout.addRow("", self.verify_check)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        self.ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Convert")
         buttons.accepted.connect(self._ok)
         buttons.rejected.connect(self.reject)
@@ -574,6 +583,45 @@ class ConvertDialog(QDialog):
             return clone_args("disk", uuid, self.target_path, existing=True)
         return clone_args("disk", uuid, self.target_path,
                           fmt=self.target_format, variant=self.target_variant)
+
+
+class FlattenDialog(ConvertDialog):
+    """Fold a differencing chain into one standalone image.
+
+    `clonemedium` of a differencing image reads through every parent, so its
+    clone is the merged disk as the guest sees it. The chain itself is left
+    alone; retiring it is a separate, deliberate step.
+    """
+
+    def __init__(self, chain: list[MediumRecord], backends: list[MediumBackend] | None = None,
+                 parent=None, known: list[MediumRecord] | None = None):
+        self._chain = chain
+        super().__init__(chain[-1], backends, parent, known)
+        self.setWindowTitle("Flatten chain")
+        names = " → ".join(
+            f"{os.path.basename(r.location) or r.uuid} ({format_mbytes(parse_capacity_mb(r.size_on_disk))})"
+            for r in chain)
+        info = QLabel(
+            f"Chain, base first: {names}<br><i>The result is one standalone image "
+            "with the state of the last link. Nothing in the chain is changed.</i>")
+        info.setWordWrap(True)
+        self.layout().insertRow(1, info)
+        base_fmt = chain[0].fmt.upper()
+        if self.fmt.findText(base_fmt) >= 0:
+            self.fmt.setCurrentText(base_fmt)
+        self.existing_check.hide()
+        self.ok_button.setText("Flatten")
+
+    def _update_default_path(self, fmt: str):
+        base, _ = os.path.splitext(self._chain[0].location)
+        self.path_edit.setText(base + "-flat" + self._extension_for(fmt))
+
+    def _needed_bytes(self) -> int:
+        capacity = parse_capacity_mb(self._src.capacity) or 0
+        if "fixed" in self.variant.currentText().lower():
+            return allocation_estimate(capacity, "Fixed")
+        allocated = sum(parse_capacity_mb(r.size_on_disk) or 0 for r in self._chain)
+        return min(allocated, capacity or allocated) * 1024 * 1024
 
 
 class CreateDiffDialog(QDialog):

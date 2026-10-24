@@ -60,3 +60,45 @@ jobs:
         with:
           name: vboxfront-deb
           path: dist/*.deb
+
+  build-desktop:
+    # Windows and macOS binaries from the same spec. VBoxManage lives
+    # elsewhere on both (Program Files / the .app bundle), which the Settings
+    # override covers; nothing here needs VirtualBox installed.
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller pillow
+      - name: Render the icon
+        run: python scripts/render_icon.py build/icon.png 512
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - name: Build
+        run: python -m PyInstaller --noconfirm --clean --distpath dist --workpath build/pyi vboxfront.spec
+      - name: Smoke test the CLI entry point
+        # The windowed Windows build has no console to print to, so the
+        # check runs from source there; the macOS binary is run itself.
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            ./dist/vboxfront --version
+          else
+            python vboxfront.py --version
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vboxfront-${{ runner.os }}
+          path: |
+            dist/vboxfront.exe
+            dist/vboxfront.app
+            dist/vboxfront
+          if-no-files-found: ignore

@@ -1,3 +1,22 @@
+vboxfront (1.11.0) unstable; urgency=medium
+
+  * Compare two images' guest-visible contents via `mediumio cat` hashes;
+    offer verification after convert and flatten. CLI `verify`.
+  * Flatten a differencing chain into one standalone image, refusing chains
+    with unregistered, inaccessible or missing links.
+  * Disk space report by VM, folder and chain, with trash totals and
+    compact candidates.
+  * Refresh automatically when VirtualBox.xml changes outside the window.
+  * Headless subcommands: list, health, space, compact-all, verify.
+  * Read-only file browsing through vboximg-mount.
+  * Golden image workflow: multiattach base attached to several VMs.
+  * Opt-in trash purge by age or total size; the newest delete is kept.
+  * Undo last change for Move, Resolve re-point and Properties edits.
+  * Match media library entries by file rather than path spelling.
+  * Ship an application icon; build Windows and macOS binaries in CI.
+
+ -- Vlad Ananyev <vlananyev@gmail.com>  Sat, 24 Oct 2026 00:00:00 +0300
+
 vboxfront (1.10.0) unstable; urgency=medium
 
   * Split the application into vboxfront_app modules for domain logic,

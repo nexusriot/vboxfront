@@ -66,6 +66,10 @@ class TrashedFile:
     kind: str
     original: str
     trashed: str
+    #: When the delete happened (epoch seconds). 0 for entries indexed before
+    #: it was recorded; the purge rule then falls back to the file's ctime,
+    #: which the rename into the trash set.
+    trashed_at: float = 0.0
 
 
 @dataclass

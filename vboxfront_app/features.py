@@ -4,11 +4,19 @@ Services own persistence and filesystem changes; this mixin connects them to
 menus and dialogs without putting more feature flows in the window shell.
 """
 from __future__ import annotations
+from dataclasses import dataclass, field
 import os
+import shlex
+import time
+from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import QComboBox, QInputDialog, QMessageBox, QFileDialog, QPushButton
-from .persistence import user_trash_dir, snapshot_dir, load_library, add_library_path
+from .persistence import (
+    get_settings, user_trash_dir, snapshot_dir, load_library, add_library_path, trash_purge_days, trash_purge_gb,
+)
 from .recovery import OperationJournal
-from .trash import TrashStore
+from .watcher import RegistryWatcher, registry_path
+from .trash import TrashStore, allocated_bytes
+from .reports import space_report
 from .library_views import SavedFilterStore
 from .batches import BatchReport
 from .feature_dialogs import (
@@ -17,6 +25,7 @@ from .feature_dialogs import (
     BatchResultsDialog,
     SnapshotComparisonDialog,
     VMStorageDialog,
+    SpaceReportDialog,
 )
 from .snapshots import load_snapshot, compare_registry, current_rows
 from .commands import attach_args, detach_args
@@ -24,10 +33,30 @@ from .compression import open_maybe_compressed
 from .domain import parse_vms_list, parse_machinereadable, slot_occupant, same_file
 
 
+@dataclass
+class UndoGroup:
+    """One user-level change and the queue entries that put it back.
+
+    Entries are added by the forward commands' follow-ups as each succeeds, so
+    a batch that stopped half-way undoes only what it did.
+    """
+    label: str
+    entries: list = field(default_factory=list)
+
+
+#: Changes remembered for undo; older ones fall off. Session-only: the
+#: commands restore registry state, which a restart may have moved on from.
+UNDO_LIMIT = 20
+
+
 class FeatureActionsMixin:
     def _init_features(self):
+        self._undo_changes: list[UndoGroup] = []
+        self.act_undo_change = self._action('Undo last change', self.undo_change, 'Ctrl+Shift+Z')
+        self.act_undo_change.setEnabled(False)
         self._trash_store = TrashStore()
         self._trash = self._trash_store.load()
+        self._auto_purge_trash()
         self._sync_undo_action()
         self._journal_error = ''
         try:
@@ -49,7 +78,21 @@ class FeatureActionsMixin:
                               ('Batch results…', self.open_batch_results),
                               ('Compare registry snapshot…', self.compare_snapshot)]:
             file_menu.addAction(self._action(label, action))
+        self.registry_watcher = RegistryWatcher(registry_path(), self)
+        self.registry_watcher.changed.connect(self._registry_file_changed)
+        self.act_auto_refresh = QAction('Auto-refresh on registry change', self)
+        self.act_auto_refresh.setCheckable(True)
+        self.act_auto_refresh.setToolTip(
+            'Refresh when VirtualBox.xml changes — the VirtualBox GUI, a VM or '
+            'another tool editing the registry')
+        self.act_auto_refresh.setChecked(get_settings().value('ui/auto_refresh', True, bool))
+        self.act_auto_refresh.toggled.connect(self._toggle_auto_refresh)
+        media_menu.insertAction(self.act_details, self.act_auto_refresh)
+        self.registry_watcher.set_enabled(self.act_auto_refresh.isChecked())
+        media_menu.insertAction(self.act_undo_delete, self.act_undo_change)
         media_menu.addAction(self._action('Trash manager…', self.open_trash))
+        self.act_space = self._action('Disk space report…', self.open_space_report)
+        media_menu.insertAction(self.act_health, self.act_space)
         media_menu.addAction(self._action('VM storage…', self.open_vm_storage))
         self._filter_store = SavedFilterStore()
         toolbar = self.filter_edit.parentWidget()
@@ -103,6 +146,84 @@ class FeatureActionsMixin:
         self._trash = self._trash_store.load()
         self._sync_undo_action()
         self.refresh_media()
+
+    def _open_undo_group(self, label: str) -> UndoGroup:
+        return UndoGroup(label)
+
+    def _push_undo_group(self, group: UndoGroup):
+        # A group may still be empty while its commands run; earlier empty
+        # ones are runs that failed before changing anything.
+        self._undo_changes = [g for g in self._undo_changes if g.entries][-(UNDO_LIMIT - 1):]
+        self._undo_changes.append(group)
+        self._sync_undo_change_action()
+
+    def _last_undo_group(self) -> UndoGroup | None:
+        return next((g for g in reversed(self._undo_changes) if g.entries), None)
+
+    def _sync_undo_change_action(self):
+        group = self._last_undo_group()
+        self.act_undo_change.setEnabled(group is not None)
+        self.act_undo_change.setText(f'Undo {group.label}' if group else 'Undo last change')
+
+    def undo_change(self):
+        """Put back the most recent move, re-point or properties edit."""
+        group = self._last_undo_group()
+        if group is None or not self._require_idle():
+            return
+        listing = '\n'.join(' '.join(shlex.quote(a) for a in ['VBoxManage', *args])
+                             for args, _stdin, _follow in group.entries)
+        if QMessageBox.question(self, 'Undo', f'Undo the {group.label}? This runs:\n\n{listing}'
+                                ) != QMessageBox.StandardButton.Yes:
+            return
+        if self._run_queue(list(group.entries), f'undo {group.label}'):
+            self._undo_changes.remove(group)
+        self._sync_undo_change_action()
+
+    def trash_bytes(self) -> int:
+        return sum(allocated_bytes(e.trashed) or 0 for b in self._trash_store.load() for e in b)
+
+    def open_space_report(self):
+        dlg = SpaceReportDialog(space_report(self.media, self.trash_bytes()), self)
+        if dlg.exec() and dlg.compact_uuids:
+            wanted = set(dlg.compact_uuids)
+            disks = [r for r in self.media['disk'] if r.uuid in wanted]
+            if disks and QMessageBox.question(
+                    self, 'Compact', f'Compact {len(disks)} disk(s) one after another?'
+            ) == QMessageBox.StandardButton.Yes:
+                self._compact(disks)
+
+    def _toggle_auto_refresh(self, on: bool):
+        get_settings().setValue('ui/auto_refresh', on)
+        self.registry_watcher.set_enabled(on)
+
+    def _registry_file_changed(self):
+        """VirtualBox.xml settled after a write that was not ours.
+
+        Our own commands are followed by a refresh anyway, so a change seen
+        while one runs, while a refresh is under way or just after it is ours
+        and skipped — otherwise every command would refresh twice.
+        """
+        if (self.runner.is_busy() or self._refreshing or self._cmd_queue
+                or time.monotonic() < self._watch_quiet_until):
+            return
+        self.runner.note('[registry] VirtualBox.xml changed outside this window; refreshing')
+        self.refresh_media()
+
+    def _auto_purge_trash(self):
+        """Apply the opt-in purge rule from Settings; a no-op while it is off.
+
+        Batches are filtered in place: a Remove still in progress holds a
+        reference to its own batch list and keeps appending to it.
+        """
+        deleted, errors = self._trash_store.purge(trash_purge_days(), trash_purge_gb() * 1024 ** 3)
+        for entry in deleted:
+            self.runner.note(f'[trash] purged {entry.trashed} (was {entry.original})')
+        for line in errors:
+            self.runner.note(f'[trash] could not purge {line}')
+        if deleted:
+            for batch in self._trash:
+                batch[:] = [e for e in batch if e not in deleted]
+            self._sync_undo_action()
 
     def open_recovery(self):
         if not self._require_idle():

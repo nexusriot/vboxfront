@@ -43,6 +43,10 @@ from PyQt6.QtWidgets import (  # noqa: E402
 
 import vboxfront  # noqa: E402
 import vboxfront_app.media_dialogs as media_dialogs_module
+import vboxfront_app.feature_dialogs  # noqa: E402
+import vboxfront_app.mounts  # noqa: E402
+import vboxfront_app.workflows  # noqa: E402
+from PyQt6.QtGui import QDesktopServices  # noqa: E402
 from e2e import fake_vboxmanage  # noqa: E402
 from vboxfront import (  # noqa: E402
     COL_CAPACITY,
@@ -1583,6 +1587,320 @@ class MultiPropertiesTest(E2ECase):
 
         types = {m["type"] for m in self.read_state()["media"]}
         self.assertEqual(types, {"writethrough"})
+
+
+class UndoChangeTest(E2ECase):
+    def test_a_move_is_undone_file_registry_and_library_alike(self):
+        disk = self.seed_disk("mv.vdi")
+        old = disk["location"]
+        new = os.path.join(self.images, "elsewhere", "mv.vdi")
+        save_library("disk", [old])
+        w = self.open_window()
+        self.select("mv.vdi")
+        with mock.patch.object(QFileDialog, "getSaveFileName", return_value=(new, "")):
+            w.move_selected()
+        self.assertTrue(self.settled())
+        self.assertTrue(os.path.isfile(new))
+        self.assertEqual(load_library("disk"), [new])
+        self.assertTrue(w.act_undo_change.isEnabled())
+        self.assertEqual(w.act_undo_change.text(), "Undo move of mv.vdi")
+
+        with mock.patch.object(QMessageBox, "question", return_value=YES):
+            w.undo_change()
+        self.assertTrue(self.settled())
+        self.assertTrue(os.path.isfile(old))
+        self.assertFalse(os.path.exists(new))
+        self.assertEqual(self.read_state()["media"][0]["location"], old)
+        self.assertEqual(load_library("disk"), [old])
+        self.assertFalse(w.act_undo_change.isEnabled())
+
+    def test_a_properties_edit_is_undone_for_every_medium(self):
+        self.seed_disk("u1.vdi", description="first")
+        self.seed_disk("u2.vdi")
+        w = self.open_window()
+        self.select_many(["u1.vdi", "u2.vdi"])
+
+        def prepare(dlg):
+            dlg.type_combo.setCurrentText("writethrough")
+            dlg._ok()
+
+        self.run_dialog(w.edit_properties_selected, prepare)
+        self.assertTrue(self.settled())
+        self.assertEqual({m["type"] for m in self.read_state()["media"]}, {"writethrough"})
+        self.assertEqual(w.act_undo_change.text(), "Undo properties of 2 media")
+        with mock.patch.object(QMessageBox, "question", return_value=YES):
+            w.undo_change()
+        self.assertTrue(self.settled())
+        media = self.read_state()["media"]
+        self.assertEqual({m["type"] for m in media}, {"normal"})
+        self.assertEqual(media[0]["description"], "first")
+
+    def test_declining_the_confirmation_keeps_the_undo(self):
+        self.seed_disk("keep.vdi")
+        w = self.open_window()
+        self.select("keep.vdi")
+        new = os.path.join(self.images, "keep2.vdi")
+        with mock.patch.object(QFileDialog, "getSaveFileName", return_value=(new, "")):
+            w.move_selected()
+        self.assertTrue(self.settled())
+        with mock.patch.object(QMessageBox, "question", return_value=NO):
+            w.undo_change()
+        self.assertTrue(self.settled())
+        self.assertTrue(os.path.isfile(new))
+        self.assertTrue(w.act_undo_change.isEnabled())
+
+
+def write_at(path: str, offset: int, data: bytes) -> None:
+    with open(path, "r+b") as handle:
+        handle.seek(offset)
+        handle.write(data)
+
+
+def finish_verify(dlg):
+    """Stand-in for VerifyDialog.exec: let the hashing finish, then accept."""
+    dlg.task.wait(30_000)
+    wait_until(lambda: dlg.results is not None, 10)
+    finish_verify.last = dlg
+    return QDialog.DialogCode.Accepted
+
+
+class FlattenAndVerifyTest(E2ECase):
+    MB = 1024 * 1024
+
+    def seed_chain(self):
+        base = self.seed_disk("base.vdi", capacity_mb=8)
+        write_at(base["location"], 2 * self.MB, b"base data" * 100)
+        child = self.seed_disk("child.vdi", capacity_mb=8, parent=base["uuid"],
+                               variant="dynamic differencing")
+        write_at(child["location"], 5 * self.MB, b"child data" * 100)
+        return base, child
+
+    def test_flattening_a_chain_yields_one_image_with_every_layer(self):
+        _base, child = self.seed_chain()
+        w = self.open_window()
+        self.select("child.vdi")
+        target = os.path.join(self.images, "base-flat.vdi")
+
+        def prepare(dlg):
+            self.assertEqual(dlg.path_edit.text(), target)
+            dlg.verify_check.setChecked(True)
+            dlg._ok()
+
+        with mock.patch.object(vboxfront_app.feature_dialogs.VerifyDialog, "exec", finish_verify):
+            self.run_dialog(w.flatten_selected, prepare)
+            self.assertTrue(self.settled())
+            self.assertTrue(wait_until(lambda: getattr(finish_verify, "last", None) is not None
+                                       and finish_verify.last.sources[1].medium == target))
+        dlg = finish_verify.last
+        finish_verify.last = None
+        self.assertTrue(dlg.identical, dlg.verdict.text())
+        self.assertTrue(self.settled())
+        flat = next(m for m in self.read_state()["media"] if m["location"] == target)
+        self.assertEqual(flat["parent"], "")
+        with open(target, "rb") as handle:
+            handle.seek(2 * self.MB)
+            self.assertTrue(handle.read(9) == b"base data")
+            handle.seek(5 * self.MB)
+            self.assertTrue(handle.read(10) == b"child data")
+        self.assertTrue(os.path.isfile(child["location"]))
+        self.assertTrue(any(c.startswith("clonemedium disk " + child["uuid"]) for c in self.calls()))
+
+    def test_flatten_refuses_a_base_image_and_a_broken_chain(self):
+        base, child = self.seed_chain()
+        w = self.open_window()
+        self.select("base.vdi")
+        with mock.patch.object(QMessageBox, "information") as info:
+            w.flatten_selected()
+        info.assert_called_once()
+        os.unlink(base["location"])
+        w.refresh_media()
+        self.assertTrue(self.settled())
+        self.select("child.vdi")
+        with mock.patch.object(QMessageBox, "warning") as warn, \
+                mock.patch.object(QDialog, "exec") as opened:
+            w.flatten_selected()
+        warn.assert_called_once()
+        opened.assert_not_called()
+
+    def test_compare_contents_tells_a_changed_copy_apart(self):
+        a = self.seed_disk("a.vdi", capacity_mb=4)
+        b = self.seed_disk("b.vdi", capacity_mb=4)
+        w = self.open_window()
+        self.select("a.vdi")
+        label_b = f"b.vdi  ({b['uuid']})"
+        with mock.patch.object(QInputDialog, "getItem", return_value=(label_b, True)), \
+                mock.patch.object(vboxfront_app.feature_dialogs.VerifyDialog, "exec", finish_verify):
+            w.verify_selected()
+            self.assertTrue(finish_verify.last.identical, finish_verify.last.verdict.text())
+            write_at(b["location"], 3 * self.MB, b"drift")
+            w.verify_selected()
+            self.assertFalse(finish_verify.last.identical)
+            self.assertIn("differ", finish_verify.last.verdict.text())
+        finish_verify.last = None
+        self.assertTrue(os.path.isfile(a["location"]))
+
+    def test_compare_against_a_raw_export_file(self):
+        disk = self.seed_disk("r.vdi", capacity_mb=4)
+        write_at(disk["location"], self.MB, b"payload")
+        raw = os.path.join(self.images, "r.img")
+        with open(raw, "wb") as handle:
+            handle.truncate(4 * self.MB)
+        write_at(raw, self.MB, b"payload")
+        w = self.open_window()
+        self.select("r.vdi")
+        with mock.patch.object(QInputDialog, "getItem",
+                               return_value=(vboxfront_app.workflows.FLAT_FILE_CHOICE, True)), \
+                mock.patch.object(QFileDialog, "getOpenFileName", return_value=(raw, "")), \
+                mock.patch.object(vboxfront_app.feature_dialogs.VerifyDialog, "exec", finish_verify):
+            w.verify_selected()
+        self.assertTrue(finish_verify.last.identical, finish_verify.last.verdict.text())
+        finish_verify.last = None
+
+
+class GoldenImageTest(E2ECase):
+    def test_each_vm_gets_its_own_child_of_a_multiattach_base(self):
+        state = self.read_state()
+        state["vms"].append(self.vm("beta", SECOND_VM_UUID))
+        self.write_state(**state)
+        base = self.seed_disk("gold.vdi")
+        w = self.open_window()
+        self.select("gold.vdi")
+
+        def prepare(dlg):
+            for i in range(dlg.tree.topLevelItemCount()):
+                dlg.tree.topLevelItem(i).setCheckState(0, Qt.CheckState.Checked)
+            dlg._ok()
+
+        self.run_dialog(w.golden_image_selected, prepare)
+        self.assertTrue(self.settled())
+        media = self.read_state()["media"]
+        gold = next(m for m in media if m["uuid"] == base["uuid"])
+        self.assertEqual(gold["type"], "multiattach")
+        children = [m for m in media if m.get("parent") == base["uuid"]]
+        self.assertEqual(len(children), 2)
+        attached = {a["uuid"] for v in self.read_state()["vms"] for a in v["attachments"]}
+        self.assertEqual(attached, {c["uuid"] for c in children})
+
+    def test_a_running_vm_cannot_be_ticked(self):
+        state = self.read_state()
+        state["running"] = [VM_UUID]
+        self.write_state(**state)
+        self.seed_disk("gold2.vdi")
+        w = self.open_window()
+        self.select("gold2.vdi")
+        seen = {}
+
+        def prepare(dlg):
+            item = dlg.tree.topLevelItem(0)
+            seen["enabled"] = bool(item.flags() & Qt.ItemFlag.ItemIsEnabled)
+            seen["note"] = item.text(2)
+
+        self.run_dialog(w.golden_image_selected, prepare, accept=False)
+        self.assertFalse(seen["enabled"])
+        self.assertIn("running", seen["note"])
+
+
+class BrowseTest(E2ECase):
+    def test_mount_shows_the_command_and_unmount_cleans_up(self):
+        self.seed_disk("look.vdi")
+        tool = os.path.join(self.dir, "vboximg-mount")
+        with open(tool, "w", encoding="utf-8") as handle:
+            # Like the real tool: daemonises, so the launcher exits 0 at once.
+            handle.write("#!/bin/sh\nexit 0\n")
+        os.chmod(tool, 0o755)
+        w = self.open_window()
+        self.select("look.vdi")
+        mounted = set()
+        with mock.patch.object(vboxfront_app.mounts, "vboximg_mount_path", return_value=tool), \
+                mock.patch.object(vboxfront_app.mounts.ImageMounts, "is_mounted",
+                                  staticmethod(lambda p: p in mounted)), \
+                mock.patch.object(vboxfront_app.mounts, "unmount_command",
+                                  return_value=["true"]), \
+                mock.patch.object(QDesktopServices, "openUrl") as opened:
+            mountpoint = w.image_mounts.mount("look.vdi", "uuid-x")
+            mounted.add(mountpoint)
+            self.assertTrue(wait_until(lambda: opened.called, 5))
+            self.assertTrue(w.act_unmount.isEnabled())
+            self.assertIn("--image uuid-x -g", w.runner.output.toPlainText())
+            self.assertEqual(w.unmount_browsed(), [])
+        self.assertFalse(os.path.exists(mountpoint))
+        self.assertFalse(w.act_unmount.isEnabled())
+
+    def test_a_mount_that_never_appears_is_reported(self):
+        self.seed_disk("nope.vdi")
+        tool = os.path.join(self.dir, "vboximg-mount")
+        with open(tool, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\n"
+                         "echo 'vboximg-mount: error: Error parsing volumes on disk' >&2\n"
+                         "exit 1\n")
+        os.chmod(tool, 0o755)
+        w = self.open_window()
+        with mock.patch.object(vboxfront_app.mounts, "vboximg_mount_path", return_value=tool), \
+                mock.patch.object(QMessageBox, "warning") as warn:
+            mountpoint = w.image_mounts.mount("nope.vdi", "x")
+            self.assertTrue(wait_until(lambda: warn.called, 5))
+        self.assertIn("Error parsing volumes on disk", warn.call_args[0][2])
+        self.assertIn("never been partitioned", warn.call_args[0][2])
+        self.assertFalse(os.path.exists(mountpoint))
+
+
+class CliTest(E2ECase):
+    """The headless subcommands, against the same fake and library."""
+
+    def cli(self, *argv):
+        import io
+        from vboxfront_app import cli
+        out = io.StringIO()
+        code = cli.main(list(argv), out=out)
+        return code, out.getvalue()
+
+    def test_list_includes_library_entries_as_json(self):
+        self.seed_disk("one.vdi")
+        code, out = self.cli("list", "--kind", "disk")
+        self.assertEqual(code, 0)
+        self.assertEqual([row["name"] for row in json.loads(out)], ["one.vdi"])
+        code, out = self.cli("list", "--csv")
+        self.assertTrue(out.startswith("name,"))
+
+    def test_health_exit_code_reflects_errors(self):
+        self.seed_disk("fine.vdi")
+        self.assertEqual(self.cli("health")[0], 0)
+        self.seed_disk("broken.vdi", state="inaccessible",
+                       access_error="Could not open the medium")
+        code, out = self.cli("health")
+        self.assertEqual(code, 1)
+        self.assertIn("broken.vdi", out)
+
+    def test_space_json(self):
+        self.seed_disk("s.vdi")
+        code, out = self.cli("space", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)[0]["title"], "Totals")
+
+    def test_compact_all_plans_by_default_and_runs_on_request(self):
+        disk = self.seed_disk("c.vdi", capacity_mb=64)
+        with open(disk["location"], "r+b") as handle:
+            handle.write(b"\1" * (8 * 1024 * 1024))
+        code, out = self.cli("compact-all")
+        self.assertEqual(code, 0)
+        self.assertIn(f"modifymedium disk {disk['uuid']} --compact", out)
+        self.assertFalse(any("--compact" in c for c in self.calls()))
+        code, out = self.cli("compact-all", "--run")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(any("--compact" in c for c in self.calls()))
+        self.assertEqual(load_history()[-1]["exit"], 0)
+
+    def test_verify_exit_codes(self):
+        a = self.seed_disk("va.vdi", capacity_mb=2)
+        b = self.seed_disk("vb.vdi", capacity_mb=2)
+        code, out = self.cli("verify", a["uuid"], b["location"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("Identical", out)
+        with open(b["location"], "r+b") as handle:
+            handle.seek(1024 * 1024)
+            handle.write(b"x")
+        self.assertEqual(self.cli("verify", a["uuid"], b["uuid"])[0], 1)
+        self.assertEqual(self.cli("verify", a["uuid"], "/nowhere.vdi")[0], 3)
 
 
 class OrphanCollisionTest(E2ECase):

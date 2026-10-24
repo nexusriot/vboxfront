@@ -658,7 +658,7 @@ VBoxManage is replaced.
   collision message exists for. An earlier version guessed at that by
   comparing file contents, and declared two blank images of the same size
   copies of each other.
-- `e2e/test_e2e.py` drives 72 scenarios across create/remove (delete into the
+- `e2e/test_e2e.py` drives 88 scenarios across create/remove (delete into the
   trash, undo as a batch and newest-first, a DVD coming back to its own shelf,
   a failed unregister that must not move anything, and the real `--delete`
   once the trash is turned off through the Settings dialog itself),
@@ -732,6 +732,38 @@ cached only when the source stat signature is unchanged. The cache includes
 path, device/inode, length, nanosecond mtime and ctime and lasts for the session.
 The dialog refuses Import while a measurement is still active.
 
+## Workflows built from existing commands
+
+Release 1.11.0 adds no new kind of VBoxManage call; each workflow strings
+together commands the app already ran one at a time, and keeps the rule that
+every action is a visible command.
+
+- **Compare contents** hashes `mediumio cat --output=-` for both media on a
+  worker thread (`verify.py`), stderr to a temp file so a chatty failure
+  cannot stall the stream. Container formats differ, guest data does not, so
+  this is the only meaningful equality between a VDI and its VMDK clone.
+- **Flatten** is `clonemedium` of the last link: VirtualBox reads through the
+  parents, so the clone is the merged disk. `reports.chain_problems` refuses
+  a chain with an unregistered parent, an inaccessible link or a link whose
+  file is gone — the case the registry still calls "created".
+- **Golden image** is `modifymedium --type multiattach` then one
+  `storageattach` per VM. VirtualBox creates each VM's differencing image
+  itself; the app only picks a free slot (`domain.first_free_disk_slot`, never
+  a floppy controller, never an occupied slot) and takes a registry snapshot.
+- **Browse** runs `vboximg-mount --image <uuid> -g <dir>` under
+  `$XDG_RUNTIME_DIR/vboxfront-mounts`. The mount is judged by the mountpoint
+  appearing, so it works whether the tool stays in the foreground or forks.
+- **Undo last change** records inverse commands from each forward command's
+  follow-up, so only what succeeded is undone. Properties are restored with
+  auto-reset first, while the disk is still immutable.
+- **Auto-refresh** watches VirtualBox.xml *and* its folder: VBoxSVC saves by
+  rename, which drops a plain file watch. Events are debounced, compared by
+  (mtime, size, inode), and ignored while a command or refresh of ours runs
+  and for three seconds after a refresh, since our own command already
+  triggers one.
+- **CLI** (`cli.py`) reuses the parsers, builders, library and history; it
+  never imports QtWidgets. `compact-all` prints its plan unless `--run`.
+
 ## Known limitations
 
 | Limitation | Why / workaround |
@@ -744,10 +776,13 @@ The dialog refuses Import while a measurement is still active.
 | `repairhd -dry-run` sign-off | Prints "Corrupted VDI image repaired successfully" whatever it found, having written nothing; the verdict is the line above it |
 | Free-space estimates | A guess: they cannot know about compression, reflinks or a quota about to change, so they warn and never refuse |
 | A resize or format needs a childless medium | A parent is read-only to VirtualBox; both actions name the child and stop rather than passing `VERR_VD_IMAGE_READ_ONLY` along |
-| Trash has no automatic purge | Use Trash manager to restore or permanently delete selected indexed files, or manage the files manually |
+| Trash purge is opt-in | Off by default; Settings can purge by age or total size. The newest delete batch is never purged, so a cap smaller than one disk still leaves Undo delete working |
 | Undo depends on its persisted index | Delete batches survive restarts through QSettings; clearing or losing those settings leaves the trash files in place but removes their original-path metadata |
 | A trashed file still occupies its disk | A rename frees nothing: the space comes back only when the trash folder is cleared |
 | An ETA is linear extrapolation | From the only signal there is, the percentage VBoxManage prints; a clone is not uniform work, so it is prefixed "~" and nothing is shown below 5% or in the first seconds |
 | Drift is reported, not resolved | Unexpected registry changes are noted after refresh; listings can become stale again and failed captures or library-cache invalidation may require another refresh |
 | Compressed import is gzip/bzip2/xz | All three are standard library, so nothing has to be installed. zstd and lz4 would need an external binary, and a missing one is a worse failure than not offering the format |
+| Undo last change is session-only | Move, re-point and Properties edits are undone by commands built from the listing before the change; after a restart the registry may have moved on, so nothing is persisted |
+| Compare contents reads everything | `mediumio cat` streams the whole guest-visible disk on both sides; a 100 GB disk is 200 GB read. Encrypted media are not offered |
+| Browse needs FUSE and a partition table | `vboximg-mount` ships with VirtualBox on Linux and macOS, not Windows, and is always read-only here. On 7.2 it refuses a blank disk ("Error parsing volumes on disk") and shows an unpartitioned filesystem only as `vhdd`. Its daemon holds the medium for a moment after unmount, so an immediate Remove can report it in use |
 | The end-to-end suite talks to a fake | Faithful to 7.2.12's output shapes, but it cannot notice VBoxManage changing them; the real-VirtualBox pass stays manual |

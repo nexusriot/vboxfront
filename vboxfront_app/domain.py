@@ -369,6 +369,23 @@ def slot_occupant(info: dict[str, str], controller: str, port: int, device: int)
     return "" if current in ("none", "") else current
 
 
+def first_free_disk_slot(info: dict[str, str]) -> tuple[str, int, int] | None:
+    """(controller, port, device) where a hard disk could go, or None.
+
+    Floppy controllers are skipped; anything else takes a disk. Controllers
+    are tried in the VM's own order, which is the order its GUI shows them.
+    """
+    types = controller_types(info)
+    for name, ports in vm_storage_controllers(info):
+        ctype = types.get(name, "")
+        if ctype.upper() == "I82078":
+            continue
+        slots = free_slots(info, name, ports, max_device_index(ctype), 1)
+        if slots:
+            return (name, *slots[0])
+    return None
+
+
 def parse_byte_size(text: str) -> int | None:
     """Accept 4096, 0x1000, 8K, 1.5M, 2G — offsets into an image are quoted
     every which way, and a hex offset is what a partition table hands you."""

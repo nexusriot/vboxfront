@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 import os
+import time
 
 from .app_dialogs import (
     CommandHistoryDialog,
@@ -36,6 +37,7 @@ from .commands import (
     list_media_args,
     mediumio_formatfat_args,
     move_args,
+    setlocation_args,
     repairhd_args,
 )
 from .constants import (
@@ -115,11 +117,12 @@ from .persistence import (
 from .processes import CaptureRunner, CommandRunner
 from .version import APP_VERSION
 from .features import FeatureActionsMixin
+from .workflows import WorkflowActionsMixin
 from .batches import BatchReport
 from .widgets import MediaPane, confirm_space
 
 
-class MainWindow(FeatureActionsMixin, QMainWindow):
+class MainWindow(WorkflowActionsMixin, FeatureActionsMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"VBoxFront {APP_VERSION} — VBoxManage GUI")
@@ -130,8 +133,6 @@ class MainWindow(FeatureActionsMixin, QMainWindow):
         # Path to add to the library once the current command succeeds
         # (used after `convertfromraw`, which only writes the file).
         self._pending_library_add: tuple[str, str] | None = None
-        # (old, new) library path to rewrite after a successful --move.
-        self._pending_library_move: tuple[str, str] | None = None
         # Commands queued behind the currently running one (batch operations),
         # each with its own follow-up to run when *that* command succeeds. A
         # single shared pending-action slot cannot work for a batch: the
@@ -148,6 +149,8 @@ class MainWindow(FeatureActionsMixin, QMainWindow):
         self._trash: list[list[TrashedFile]] = []
         self._refreshing = False
         self._refresh_pending = False
+        #: Registry-file events before this monotonic time are our own writes.
+        self._watch_quiet_until = 0.0
         #: Fingerprint of the registry as this window last saw it, and whether
         #: a command of ours is what changed it. A difference with no command
         #: in between means something else edited the registry.
@@ -165,6 +168,8 @@ class MainWindow(FeatureActionsMixin, QMainWindow):
         self.setAcceptDrops(True)
         self._build_ui()
         self._init_features()
+        self._init_workflows()
+        self._update_actions()
         self._refresh_check_vbm()
         self.refresh_media()
 
@@ -438,7 +443,9 @@ class MainWindow(FeatureActionsMixin, QMainWindow):
         for act in (self.act_create, self.act_fromraw, self.act_import_compressed,
                     self.act_compact, self.act_compact_all,
                     self.act_resize, self.act_convert, self.act_props, self.act_move,
-                    self.act_encrypt, self.act_create_diff, self.act_export_raw):
+                    self.act_encrypt, self.act_create_diff, self.act_export_raw,
+                    *(getattr(self, name) for name in ("act_flatten", "act_golden")
+                      if hasattr(self, name))):
             act.setEnabled(is_disk)
         # formatfat writes a FAT filesystem; DVDs are read-only images.
         self.act_formatfat.setEnabled(self.current_kind() in ("disk", "floppy"))
@@ -451,7 +458,8 @@ class MainWindow(FeatureActionsMixin, QMainWindow):
         menu.addSeparator()
         for act in (self.act_compact, self.act_resize, self.act_convert,
                     self.act_move, self.act_encrypt, self.act_create_diff,
-                    self.act_formatfat, self.act_resolve):
+                    self.act_formatfat, self.act_resolve, self.act_flatten,
+                    self.act_verify, self.act_browse):
             menu.addAction(act)
         menu.addSeparator()
         for act in (self.act_copy_uuid, self.act_copy_path, self.act_copy_rows,
@@ -460,6 +468,7 @@ class MainWindow(FeatureActionsMixin, QMainWindow):
         menu.addSeparator()
         menu.addAction(self.act_remove)
         menu.addAction(self.act_undo_delete)
+        menu.addAction(self.act_undo_change)
         menu.exec(pane.tree.viewport().mapToGlobal(pos))
 
     def _toggle_details(self, on: bool):
@@ -662,6 +671,7 @@ class MainWindow(FeatureActionsMixin, QMainWindow):
         self._report_reclaimed()
         self._check_drift()
         self._forget_vanished_library_entries()
+        self._watch_quiet_until = time.monotonic() + 3
         self._refreshing = False
         if self._refresh_pending:
             self._refresh_pending = False
@@ -933,7 +943,7 @@ class MainWindow(FeatureActionsMixin, QMainWindow):
             return
         if dlg.overwrite and not self._clear_target(dlg.target_path):
             return
-        self.runner.run(dlg.args(m.uuid))
+        self._run_clone(dlg, m)
 
     def _convert_batch(self, disks: list[MediumRecord]):
         dlg = BatchConvertDialog(disks, self.backends, self,
@@ -1072,11 +1082,25 @@ class MainWindow(FeatureActionsMixin, QMainWindow):
         dlg = PropertiesDialog(media, self)
         if not dlg.exec():
             return
-        commands = dlg.commands(self.current_kind())
-        if not commands:
+        kind = self.current_kind()
+        entries = []
+        group = self._open_undo_group(
+            f"properties of {os.path.basename(media[0].location) or media[0].uuid}"
+            if len(media) == 1 else f"properties of {len(media)} media")
+        for medium in media:
+            forward = dlg.commands_for(kind, medium)
+            if not forward:
+                continue
+            undo = [(c, None, None) for c in dlg.undo_commands_for(kind, medium)]
+            # Recorded once the medium's first call succeeds: restoring a
+            # field the batch never reached just re-sets its current value.
+            entries.append((forward[0], None, lambda u=undo: group.entries.extend(u)))
+            entries += [(c, None, None) for c in forward[1:]]
+        if not entries:
             self.statusBar().showMessage("Properties unchanged.")
             return
-        self._run_queue([(c, None, None) for c in commands], "change properties")
+        if self._run_queue(entries, "change properties"):
+            self._push_undo_group(group)
 
     def move_selected(self):
         m = self._require_selection()
@@ -1090,8 +1114,21 @@ class MainWindow(FeatureActionsMixin, QMainWindow):
             return
         if not self._require_idle():
             return
-        self._pending_library_move = (m.location, path)
-        self.runner.run(move_args(m.uuid, path))
+        old, name = m.location, os.path.basename(m.location) or m.uuid
+        self._followup = lambda: self._moved(m.uuid, old, path, name)
+        if not self.runner.run(move_args(m.uuid, path)):
+            self._followup = None
+
+    def _moved(self, uuid: str, old: str, new: str, name: str, undoable: bool = True):
+        """Follow a disk file to its new place: library entry, then undo."""
+        for kind in KINDS:
+            if remove_library_path(kind, old):
+                add_library_path(kind, new)
+        if undoable:
+            group = self._open_undo_group(f"move of {name}")
+            group.entries.append((move_args(uuid, old), None,
+                                  lambda: self._moved(uuid, new, old, name, undoable=False)))
+            self._push_undo_group(group)
 
     def encrypt_selected(self):
         m = self._require_selection()
@@ -1361,12 +1398,13 @@ class MainWindow(FeatureActionsMixin, QMainWindow):
                     "unregistered but the file was left where it is"
                 )
                 return
-            batch.append(TrashedFile(kind, location, dest))
+            batch.append(TrashedFile(kind, location, dest, time.time()))
             self._trash_store.save(self._trash)
             self.runner.note(
                 f"[trash] moved {location} → {dest} "
                 "(Media → Undo delete puts it back)"
             )
+            self._auto_purge_trash()
             self._sync_undo_action()
         return done
 
@@ -1435,7 +1473,17 @@ class MainWindow(FeatureActionsMixin, QMainWindow):
         dlg = ResolveDialog(kind, m, self)
         if not dlg.exec() or not dlg.command or not self._require_idle():
             return
-        self.runner.run(dlg.command)
+        command = dlg.command
+        if command[3:4] == ["--setlocation"] and m.location:
+            name = os.path.basename(m.location) or m.uuid
+
+            def relocated():
+                group = self._open_undo_group(f"re-pointing of {name}")
+                group.entries.append((setlocation_args(kind, m.uuid, m.location), None, None))
+                self._push_undo_group(group)
+            self._followup = relocated
+        if not self.runner.run(command):
+            self._followup = None
 
     def open_uuid_tools(self):
         if not self._require_idle():
@@ -1633,6 +1681,7 @@ class MainWindow(FeatureActionsMixin, QMainWindow):
             # Re-check straight away: a mistyped path is far easier to connect
             # to Settings now than after the next command fails to start.
             self._refresh_check_vbm()
+            self._auto_purge_trash()
             self.refresh_media()
 
     def closeEvent(self, event):
@@ -1654,6 +1703,16 @@ class MainWindow(FeatureActionsMixin, QMainWindow):
             self.skip_queue()
             self.runner.cancel()
             self.runner.discard_secrets()
+        if self.image_mounts.mounts:
+            # A FUSE mount outlives the app that made it; leaving one behind
+            # keeps the image open in VBoxSVC.
+            problems = self.unmount_browsed()
+            if problems and QMessageBox.question(
+                self, "Still mounted",
+                "Could not unmount:\n\n" + "\n".join(problems) + "\n\nQuit anyway?",
+            ) != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
         self._save_ui_state()
         super().closeEvent(event)
 
@@ -1789,16 +1848,8 @@ class MainWindow(FeatureActionsMixin, QMainWindow):
             if add and os.path.exists(add[1]):
                 add_library_path(add[0], add[1])
                 self.runner.note(f"[library] added {add[0]} {add[1]}")
-            move, self._pending_library_move = self._pending_library_move, None
-            if move:
-                old, new = move
-                for kind in KINDS:
-                    if old in load_library(kind):
-                        remove_library_path(kind, old)
-                        add_library_path(kind, new)
         else:
             self._pending_library_add = None
-            self._pending_library_move = None
             if self._cmd_queue:
                 self.runner.note(f"[queue] aborted, {len(self._cmd_queue)} command(s) dropped")
                 self._cmd_queue = []
@@ -1813,6 +1864,7 @@ class MainWindow(FeatureActionsMixin, QMainWindow):
         self.runner.show_queue([])
         if was_batch and self._batch_report:
             self.runner.note("[batch] " + self._batch_report.summary() + "; File → Batch results")
+        self._sync_undo_change_action()
         # Most operations change the registry; refresh quietly.
         self.refresh_media()
 

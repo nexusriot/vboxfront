@@ -1,6 +1,6 @@
 # VBoxFront
 
-Current source version: **1.10.0**.
+Current source version: **1.11.0**.
 
 A small PyQt6 desktop frontend for `VBoxManage` media operations.
 
@@ -167,7 +167,8 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
   including after restarting, library entry included. **Media → Trash
   manager…** lists indexed deleted files with logical and allocated sizes,
   restores selected files, and permanently deletes selected files after
-  confirmation. Nothing is ever emptied automatically. The trash can be
+  confirmation. Nothing is emptied automatically unless a purge rule is set
+  in Settings (see *Trash purge rule*). The trash can be
   pointed elsewhere or turned off in
   *File → Settings*, and with it off `--delete` is sent for real.
 - **Resolve** — rescue a medium VirtualBox can no longer read: re-point the
@@ -244,6 +245,40 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
   rechecked before issuing the command; changed slots require reopening the view.
 - **Saved filters** live beside the filter box on a separate toolbar. Save the
   current expression under a name, apply it later, or delete the saved view.
+- **Compare contents** (*Media → Compare contents…*) — reads two images end
+  to end as the guest sees them (`mediumio cat`) and compares SHA-256 hashes,
+  so a VDI and the VMDK cloned from it can be shown identical although their
+  files share no bytes. The other side can be a flat RAW export. Convert,
+  Clone and Flatten offer **Verify contents afterwards**.
+- **Flatten chain** — select the last link of a differencing chain and clone
+  it into one standalone image (`clonemedium` reads through every parent).
+  The chain is checked first (every parent registered, readable and present
+  on disk) and left untouched afterwards.
+- **Golden image for VMs** — turns a base disk into *multiattach* and attaches
+  it to the VMs you tick, each at its first free disk slot. VirtualBox gives
+  every VM a differencing image of its own, so they share the base and never
+  write to it. Running VMs and VMs without a free slot cannot be ticked.
+- **Browse files (read-only)** — mounts an image with `vboximg-mount -g`
+  (FUSE, no root) and opens the folder: `fs<N>` holds each guest filesystem
+  it can read, `vol<N>` the raw partitions. *Unmount browsed images* (and
+  quitting) unmounts them.
+- **Disk space report** (*Media → Disk space report…*) — totals, space by VM,
+  by folder and by differencing chain, the trash, and dynamic VDIs largest
+  first as compact candidates (with a button to compact the ones you select).
+  Built from the listing on screen; runs nothing.
+- **Undo last change** (`Ctrl+Shift+Z`) — puts back the last Move (file,
+  registry and library entry), Resolve re-point (`--setlocation`) or
+  Properties edit, after showing the commands it will run. Remembered for the
+  window session, up to 20 changes; a batch that stopped half-way undoes only
+  what it did.
+- **Auto-refresh** (*Media → Auto-refresh on registry change*, on by default)
+  — watches `VirtualBox.xml` and refreshes when something else changes the
+  registry: the VirtualBox GUI, a VM starting, another tool. Changes caused by
+  this window's own commands are not refreshed twice.
+- **Trash purge rule** (*File → Settings*) — optionally delete trashed files
+  older than N days, or the oldest ones once the trash exceeds N GB. Applied
+  at start-up and after each delete; the most recent delete is always kept so
+  Undo delete keeps working. Off by default.
 
 Output recovery records live in `$XDG_DATA_HOME/vboxfront/operations.json.d/`
 (or `~/.local/share/vboxfront/operations.json.d/`). Backups and preserved partials
@@ -264,6 +299,24 @@ uses cached file timestamps/sizes for unchanged ones. If the listing loses an
 entry, its cache is invalidated so the next refresh reopens it; another refresh
 may be needed after VBoxSVC exits. Entries are dropped again when you remove
 the medium (and can be managed in *File → Settings*).
+
+## Command line
+
+The same binary runs headless when given a subcommand, for scripts and cron.
+It reads the same settings and media library as the window.
+
+```sh
+vboxfront list [--kind disk|dvd|floppy|all] [--csv]   # JSON by default
+vboxfront health [--json] [--strict]   # exit 1 on errors (2 on warnings with --strict)
+vboxfront space [--json]
+vboxfront compact-all                  # prints the script it would run
+vboxfront compact-all --run            # runs it, stopping at the first failure
+vboxfront verify <medium> <medium>     # exit 1 when contents differ
+vboxfront verify <medium> image.img --file
+```
+
+Exit code 3 means VBoxManage could not be used or a medium was not found.
+Commands run by `compact-all --run` appear in the window's command history.
 
 ## Requirements
 
@@ -387,11 +440,18 @@ sudo dpkg -r vboxfront
 vboxfront.py          CLI entry point and compatibility imports
 vboxfront_app/        Application package (domain, services, Qt UI)
   version.py          Single source of the application version
-  app.py              QApplication startup
+  app.py              QApplication startup, or the CLI when given a subcommand
+  cli.py              Headless subcommands (list, health, space, compact-all, verify)
+  icon.svg            Application icon (window, .desktop, PyInstaller)
   constants.py        CLI/UI vocabulary and capability flags
   models.py           Media, backend, trash and health records
   domain.py           Parsers, filters, media analysis and exports
   commands.py         VBoxManage argument builders
+  reports.py          Space report and differencing-chain helpers (no Qt)
+  verify.py           Content hashing through `mediumio cat`
+  mounts.py           Read-only browsing through vboximg-mount
+  watcher.py          VirtualBox.xml change detection
+  workflows.py        Flatten, compare, golden image and browse actions
   persistence.py      Settings, library, folders and registry snapshots
   recovery.py         Durable output backups and operation records
   trash.py            Persistent deleted-file index
@@ -421,7 +481,8 @@ Makefile              Wrapper over scripts/*.sh
 scripts/build.sh      PyInstaller build / run / test (provisions a local .venv)
 scripts/build-deb.sh  Assembles the .deb from the built binary
 scripts/deb/          control.tpl + desktop entry + changelog
-.github/workflows/    CI: unit tests + containerised e2e + .deb build
+scripts/render_icon.py  Rasterises icon.svg for the Windows/macOS builds
+.github/workflows/    CI: unit tests + containerised e2e + .deb + Windows/macOS builds
 build/                PyInstaller workdir (gitignored)
 ```
 
