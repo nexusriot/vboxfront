@@ -1,6 +1,6 @@
 # VBoxFront
 
-Current source version: **1.11.0**.
+Current source version: **1.12.0**.
 
 A small PyQt6 desktop frontend for `VBoxManage` media operations.
 
@@ -31,7 +31,13 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
   command to finish.
 - **Plan mode** (*File → Plan mode*) — every batch shows the exact commands
   it would run, with Copy as script and Save as…, and runs only if you say
-  so there.
+  so there. A single action that changes data is shown the same way: resize,
+  move, Resolve (re-point or repair), attach, detach, encryption, Format as
+  FAT, UUID stamping, chain relink, and an extract that writes a file.
+  Read-only actions (Info, a hex dump, a dry run, a password check) and
+  actions that only write a new file run straight away. Passwords are never
+  part of the script. Declining removes any password file made for the
+  command.
 - **Registry snapshots** — a batch remove, a batch convert and a health
   cleanup each write the whole registry aside first, UUIDs and locations
   included.
@@ -175,6 +181,16 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
   registry at a file that moved (`modifymedium --setlocation`), or check and
   repair the image itself (`internalcommands repairhd`, with a dry run
   first). Relocation never touches the file, only the registry entry.
+  **Find by UUID…** searches folders for the moved file, starting with the
+  nearest folder above the old location that still exists. VDI, VHD and
+  VMDK images store their UUID in the file, so a renamed file is still
+  found, and a lookalike with the same name is not offered. ISOs and RAW
+  images store none, so for those a file with the same name and size is
+  offered and labelled as a weaker match. The search only reads file
+  headers and runs no command. Re-pointing at a file that carries a
+  different UUID is refused: VirtualBox accepts it, exits 0 and leaves the
+  medium inaccessible. A flat VMDK whose data file did not move with it asks
+  first.
 - **Image UUID tools** — stamp a fresh UUID into a copied image so it can be
   registered alongside the original, or reattach a differencing image to its
   parent (`internalcommands sethduuid` / `sethdparentuuid`). This is the way
@@ -280,11 +296,58 @@ the open backlog lives in [ROADMAP.md](ROADMAP.md).
   at start-up and after each delete; the most recent delete is always kept so
   Undo delete keeps working. Off by default.
 
+### Backups, chains and housekeeping
+
+- **Back up to bundle** (*Media → Back up to bundle…*) — copies a medium and
+  every parent down to its base image into a `<name>.vboxbundle` folder with
+  a `manifest.json`. Files are copied byte for byte, so UUIDs and parent links
+  survive (a `clonemedium` copy would get new UUIDs). A VMDK descriptor's
+  data files go with it. Each file's SHA-256 is recorded. Runs of zeros are
+  written as holes, so the bundle is no larger than the images. A free-space
+  check runs first, and you are warned if a running VM is attached. A
+  cancelled backup leaves nothing behind.
+- **Restore bundle / Verify bundle** (*File*) — Verify re-hashes every file.
+  Restore copies the files into a folder you choose and checks every
+  checksum while copying. Nothing is registered unless all of them match. It
+  then adds the images to the library parent first, with their original
+  UUIDs. A member that is still registered with its file in place is
+  skipped, so a lost child can be restored onto a base that survived. An
+  existing target file blocks the restore, as does a UUID that is registered
+  but whose file is gone.
+- **Repair chain** (*Media → Repair chain…*, *Repair chain from file…*, or
+  *Repair chain…* in Media health) — follows a differencing chain through the
+  UUIDs stored in the image files, not the registry. A registered member whose
+  file moved is found by UUID and re-pointed. A member VirtualBox does not
+  know (a chain copied from elsewhere, or a child the orphan scan found) is
+  added to the library parent first, because VirtualBox refuses to open a
+  child before its parent. If a parent is truly lost, **Choose parent file…**
+  can write another parent's UUID into an *unregistered* child
+  (`internalcommands sethdparentuuid`). That only makes sense for an exact
+  copy of the original parent, and the dialog says so before asking. The
+  library refresh itself now always opens parents before children.
+- **Enable TRIM** (*Media → Enable TRIM on attached disks…*, or *Enable
+  TRIM…* in Media health after *Check attach flags*) — re-attaches each disk
+  that a powered-off VM has without `--discard` to the same slot with
+  `--discard on` and, optionally, `--nonrotational on` (Windows only sends TRIM
+  to an SSD). Re-attaching the same medium edits the flags in place: same
+  UUID, other flags kept. VMs are re-read just before the commands are built.
+  Running or saved VMs are listed as skipped. It respects plan mode.
+- **History of this medium** (*Media* and the context menu) — the command
+  history filtered to the commands that named this medium by UUID or path,
+  with Re-run and Save as script. The details pane shows the count and the
+  last command.
+- **Export / Import settings** (*File*) — preferences, media library, saved
+  filters and remembered folders as one JSON file; command history only if
+  ticked. Import merges by default or replaces on request. It skips a
+  VBoxManage path that is not executable on this machine, and reports library
+  files that do not exist here. Window layout and the trash index are not
+  exported, because they describe this screen and this machine's disks.
+
 Output recovery records live in `$XDG_DATA_HOME/vboxfront/operations.json.d/`
 (or `~/.local/share/vboxfront/operations.json.d/`). Backups and preserved partials
 stay beside the output file. Recovery protects the named backing file; it does
 not provide whole-VM rollback or a backup of every companion file in multi-file
-image formats. Existing-image clones (`--existing`) remain in-place writes.
+image formats (a backup bundle does, on demand). Existing-image clones (`--existing`) remain in-place writes.
 Trash/undo metadata and saved filters use the same per-user QSettings store as
 the library. The archive measurement cache lasts for the application session.
 
@@ -313,7 +376,21 @@ vboxfront compact-all                  # prints the script it would run
 vboxfront compact-all --run            # runs it, stopping at the first failure
 vboxfront verify <medium> <medium>     # exit 1 when contents differ
 vboxfront verify <medium> image.img --file
+vboxfront health --fix-moved [--in DIR]... [--run]   # re-point moved files found by UUID
+vboxfront locate <uuid|image> [--in DIR]...  # exit 1 when no file carries the UUID
+vboxfront chain <medium|image> [--in DIR]... [--fix [--run]]
+vboxfront history [<uuid|path>] [--json]
+vboxfront fix-discard [--no-ssd] [--run]     # TRIM pass-through for powered-off VMs
+vboxfront backup <medium> --to DIR [--name N] [--allow-running] [--force]
+vboxfront verify-bundle BUNDLE                # exit 1 when a file is damaged
+vboxfront restore BUNDLE --into DIR
+vboxfront settings export FILE [--with-history]
+vboxfront settings import FILE [--replace] [--only library,filters,...]
 ```
+
+Commands that change something print a shell script unless given `--run`,
+as `compact-all` does. `history`, `verify-bundle` and `settings` work
+without VBoxManage.
 
 Exit code 3 means VBoxManage could not be used or a medium was not found.
 Commands run by `compact-all --run` appear in the window's command history.
@@ -350,7 +427,8 @@ make test
 ```
 
 Runs the unit test suite (parsers against captured VBoxManage 7.2 output,
-command builders, dialog logic, and MainWindow integration against a fake
+image headers as VBoxManage 7.2.22 writes them, command builders, dialog
+logic, bundles and chains, and MainWindow integration against a fake
 `VBoxManage`) with the offscreen Qt platform — no display or VirtualBox
 installation needed.
 
@@ -441,7 +519,13 @@ vboxfront.py          CLI entry point and compatibility imports
 vboxfront_app/        Application package (domain, services, Qt UI)
   version.py          Single source of the application version
   app.py              QApplication startup, or the CLI when given a subcommand
-  cli.py              Headless subcommands (list, health, space, compact-all, verify)
+  cli.py              Headless subcommands (list, health, space, compact-all, verify,
+                      locate, chain, history, fix-discard, backup, restore, settings)
+  locate.py           UUIDs from image headers; moved-file search; parent-first order
+  chains.py           Differencing-chain tracing and repair planning (no Qt)
+  bundles.py          Backup bundles: copy, manifest, verify, restore (no Qt)
+  settings_io.py      Settings export/import
+  tools.py            Window actions for the above; tools_dialogs.py their dialogs
   icon.svg            Application icon (window, .desktop, PyInstaller)
   constants.py        CLI/UI vocabulary and capability flags
   models.py           Media, backend, trash and health records
@@ -465,7 +549,14 @@ vboxfront_app/        Application package (domain, services, Qt UI)
   *_dialogs.py        Dialog groups; attach_dialog.py handles attachments
   features.py         Recovery and library-view UI actions
   feature_dialogs.py  Recovery, trash, results, comparison and VM views
-  window.py           Main window and media workflows
+  window.py           Main window: layout, selection, UI state, menus
+  refresh.py          Refresh chain, library re-opens, drift and reclaim reports
+  command_queue.py    Batch queue, single-command plan check, runner completion
+  media_create.py     Create, add, import and export actions
+  media_edit.py       Actions on selected media (compact, resize, convert, …)
+  attach_actions.py   Attach and detach
+  removal.py          Remove and Undo delete
+  health_actions.py   Media health, attach-flag and orphan scans
 vboxfront.spec        PyInstaller spec (onefile, windowed)
 requirements.txt      Runtime Python dependency (PyQt6)
 tests/                Unit tests (stdlib unittest, offscreen Qt)
@@ -501,3 +592,12 @@ build/                PyInstaller workdir (gitignored)
 - `repairhd -dry-run` writes nothing, but on 7.2.12 it signs off with
   "Corrupted VDI image repaired successfully" whatever it found — the line
   above that one is the verdict. The health dialog says so before running it.
+- Backup bundles are file copies. A disk a running VM is writing gives an
+  inconsistent copy, so power the VM off first (the window warns; the CLI
+  refuses without `--allow-running`). A bundle is as large as the images,
+  minus runs of zeros.
+- Finding a moved file by UUID works for VDI, VHD and VMDK. ISO, RAW, QCOW,
+  QED and Parallels store no UUID, so those can only be matched by name and
+  size, and are labelled as the weaker match.
+- Enable TRIM changes powered-off VMs only; running and saved ones are
+  listed as skipped.

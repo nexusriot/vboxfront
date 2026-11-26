@@ -77,7 +77,7 @@ The original trash and session undo arrived in 1.8.0.
       against a *stateful* fake VBoxManage — a registry that persists and
       real image files — so a workflow is checked by what it changed, not by
       what it printed. The initial suite had 40 scenarios; the current suite
-      has 72. Container execution needs no VirtualBox, display or network and
+      has 107. Container execution needs no VirtualBox, display or network and
       is also a CI job.
 
 ## Correctness / polish
@@ -210,6 +210,35 @@ The original trash and session undo arrived in 1.8.0.
 The original feature proposals are delivered. Registry snapshots live in the
 per-user data directory. Long operations use a window alert; native desktop
 notifications remain a possible enhancement.
+
+## Delivered in 1.12.0 (2026-11-27)
+
+- [x] **Find by UUID…** in Resolve: search folders for a moved image by the
+      UUID in its VDI/VHD/VMDK header (name and size for ISO/RAW), on a
+      cancellable worker. Resolve refuses a target that carries another UUID,
+      and asks before re-pointing a VMDK whose extent files are missing.
+- [x] **Back up to bundle / Restore / Verify**: a medium plus its whole chain,
+      byte copies with SHA-256 manifest, VMDK extents included, sparse-aware;
+      restore verifies, then registers parent first. Closes the "whole-image
+      backup for multi-file formats" gap, on demand.
+- [x] **Repair chain**: trace through header UUIDs, re-point moved members,
+      register unknown ones parent first, confirmed `sethdparentuuid` relink
+      for an unregistered child. The library refresh opens parents first.
+- [x] **Enable TRIM**: in-place re-attach with `--discard on`
+      (`--nonrotational on` optional) for powered-off VMs; from Media health
+      after the attach-flag scan, or the Media menu.
+- [x] **History of this medium**, in a dialog and in the details pane.
+- [x] **Export / Import settings** as JSON (merge or replace).
+- [x] **CLI**: `locate`, `chain`, `history`, `fix-discard`, `backup`,
+      `restore`, `verify-bundle`, `settings`, and `health --fix-moved`.
+- [x] **Plan mode for single actions**: resize, move, Resolve, attach,
+      detach, encryption, FAT format, UUID stamping and relink are shown
+      first in plan mode (`_run_single`), by the same rule as history replay.
+- [x] `window.py` split into area mixins (1,933 → about 650 lines); no
+      behaviour change, every suite green before and after.
+- [ ] **S** — Library entries whose file moved: remember each library path's
+      UUID on refresh, so a `[library] could not open` entry can be found the
+      same way. Today only registered media have a UUID to search for.
 
 ## Delivered in 1.11.0 (2026-10-24)
 

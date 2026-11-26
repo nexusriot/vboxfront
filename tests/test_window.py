@@ -12,12 +12,14 @@ import unittest
 from unittest import mock
 
 import vboxfront
-import vboxfront_app.window as window_module
+import vboxfront_app.command_queue as command_queue_module
+import vboxfront_app.media_create as media_create_module
+import vboxfront_app.media_edit as media_edit_module
 import vboxfront_app.processes as process_module
 
 from PyQt6.QtCore import QByteArray, Qt
 
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
 
 from vboxfront import (
     COLUMNS,
@@ -1139,7 +1141,7 @@ class HealthAndScanTest(FakeVBoxManageTest):
             def dry_run_caveat(self):
                 return "[health] stub"
 
-        return mock.patch(f"vboxfront_app.window.{name}", Stub)
+        return mock.patch(f"vboxfront_app.health_actions.{name}", Stub)
 
     def test_health_reveals_a_medium_in_its_own_tab(self):
         w = self.make_window()
@@ -1400,6 +1402,57 @@ class PlanModeTest(FakeVBoxManageTest):
             lambda: not w.runner.is_busy() and not w._refreshing))
         self.assertTrue(any("--compact" in c for c in self.calls_log()))
 
+    def test_a_single_destructive_command_waits_for_the_plan(self):
+        w = self.make_window()
+        set_plan_mode(True)
+        before = len(self.calls_log())
+        secret = os.path.join(self.workdir, "pw")
+        with open(secret, "w") as handle:
+            handle.write("hunter2")
+        w._followup = lambda: self.fail("a declined command's follow-up ran")
+        seen = {}
+
+        def fake_exec(dlg):
+            seen["commands"] = dlg._commands
+            seen["labels"] = [lbl.text() for lbl in dlg.findChildren(QLabel)]
+            return 0
+
+        with mock.patch.object(vboxfront.PlanDialog, "exec", fake_exec):
+            started = w._run_single(
+                ["encryptmedium", "x", "--newpassword", secret], None, [secret],
+                title="change encryption")
+        self.assertFalse(started)
+        self.assertEqual(seen["commands"], [["encryptmedium", "x", "--newpassword", secret]])
+        self.assertTrue(any("not part of the script" in t for t in seen["labels"]))
+        self.assertIsNone(w._followup)
+        self.assertFalse(os.path.exists(secret), "a declined command's password file stays")
+        self.assertEqual(len(self.calls_log()), before)
+        self.assertIn("nothing was run", w.statusBar().currentMessage())
+
+    def test_a_single_command_runs_from_the_plan(self):
+        w = self.make_window()
+        set_plan_mode(True)
+        with mock.patch.object(vboxfront.PlanDialog, "exec",
+                               return_value=vboxfront.PlanDialog.RUN):
+            started = w._run_single(["modifymedium", "disk", "x", "--resize", "100"])
+        self.assertTrue(started)
+        self.assertTrue(wait_until(lambda: not w.runner.is_busy() and not w._refreshing))
+        self.assertTrue(any("--resize" in c for c in self.calls_log()))
+
+    def test_read_only_single_commands_and_plan_off_skip_the_plan(self):
+        w = self.make_window()
+        with mock.patch.object(vboxfront.PlanDialog, "exec") as plan:
+            set_plan_mode(True)
+            self.assertTrue(w._run_single(["showmediuminfo", "disk", "x"]))
+            self.assertTrue(wait_until(lambda: not w.runner.is_busy() and not w._refreshing))
+            self.assertTrue(w._run_single(
+                ["internalcommands", "repairhd", "-dry-run", "-format", "VDI", "/x.vdi"]))
+            self.assertTrue(wait_until(lambda: not w.runner.is_busy() and not w._refreshing))
+            set_plan_mode(False)
+            self.assertTrue(w._run_single(["modifymedium", "disk", "x", "--resize", "100"]))
+            self.assertTrue(wait_until(lambda: not w.runner.is_busy() and not w._refreshing))
+        plan.assert_not_called()
+
     def test_the_script_quotes_every_argument(self):
         script = plan_script([["modifymedium", "disk", "a b", "--compact"]])
         self.assertIn("'a b'", script)
@@ -1423,7 +1476,7 @@ class RegistrySnapshotTest(FakeVBoxManageTest):
             def exec(self):
                 return 1
 
-        with mock.patch("vboxfront_app.window.RemoveDialog", Stub):
+        with mock.patch("vboxfront_app.removal.RemoveDialog", Stub):
             w.remove_selected()
         self.assertTrue(wait_until(
             lambda: not w.runner.is_busy() and not w._cmd_queue and not w._refreshing))
@@ -1441,7 +1494,7 @@ class RegistrySnapshotTest(FakeVBoxManageTest):
 
     def test_a_snapshot_that_cannot_be_written_does_not_stop_anything(self):
         w = self.make_window()
-        with mock.patch.object(window_module, "write_registry_snapshot",
+        with mock.patch.object(command_queue_module, "write_registry_snapshot",
                                return_value=""):
             w._snapshot_registry("probe")
         self.assertIn("could not write a registry snapshot",
@@ -1621,7 +1674,7 @@ class ReviewRegressionTest(FakeVBoxManageTest):
         dlg = mock.Mock(overwrite=targets)
         dlg.exec.return_value = 1
         dlg.commands.return_value = commands
-        with mock.patch.object(window_module, 'BatchConvertDialog', return_value=dlg), \
+        with mock.patch.object(media_edit_module, 'BatchConvertDialog', return_value=dlg), \
              mock.patch.object(w.runner, 'run', return_value=True):
             w._convert_batch(disks)
             self.assertFalse(os.path.exists(targets[0]))
@@ -1638,7 +1691,7 @@ class ReviewRegressionTest(FakeVBoxManageTest):
         dlg = mock.Mock(overwrite=[c[3] for c in commands])
         dlg.exec.return_value = 1
         dlg.commands.return_value = commands
-        with mock.patch.object(window_module, 'BatchConvertDialog', return_value=dlg), \
+        with mock.patch.object(media_edit_module, 'BatchConvertDialog', return_value=dlg), \
              mock.patch.object(vboxfront.PlanDialog, 'exec', return_value=vboxfront.PlanDialog.RUN), \
              mock.patch.object(w, '_snapshot_registry') as snapshot, \
              mock.patch.object(w, '_clear_target', return_value=True) as clear, \
@@ -1656,7 +1709,7 @@ class ReviewRegressionTest(FakeVBoxManageTest):
         dlg = mock.Mock(overwrite=['/out/a.vdi'])
         dlg.exec.return_value = 1
         dlg.commands.return_value = [vboxfront.clone_args('disk', 'uuid', '/out/a.vdi')]
-        with mock.patch.object(window_module, 'BatchConvertDialog', return_value=dlg), \
+        with mock.patch.object(media_edit_module, 'BatchConvertDialog', return_value=dlg), \
              mock.patch.object(vboxfront.PlanDialog, 'exec', return_value=0), \
              mock.patch.object(w, '_clear_target') as clear, \
              mock.patch.object(w, '_snapshot_registry') as snapshot:
@@ -1673,7 +1726,7 @@ class ReviewRegressionTest(FakeVBoxManageTest):
             handle.write(b'keep me')
         with mock.patch.object(vboxfront.QFileDialog, 'getSaveFileName', return_value=(path, '')), \
              mock.patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes), \
-             mock.patch.object(window_module, 'confirm_space', return_value=False):
+             mock.patch.object(media_create_module, 'confirm_space', return_value=False):
             w.export_raw()
         with open(path, 'rb') as handle:
             self.assertEqual(handle.read(), b'keep me')
@@ -1684,7 +1737,7 @@ class ReviewRegressionTest(FakeVBoxManageTest):
         with open(target, 'wb') as handle:
             handle.write(b'keep me')
         w.media['disk'][0].location = target
-        with mock.patch.object(window_module, 'ask_target_format_and_path',
+        with mock.patch.object(media_create_module, 'ask_target_format_and_path',
                                return_value=('VDI', target, True)), \
              mock.patch.object(QMessageBox, 'warning') as warning:
             w.convert_from_raw('/source.raw')
@@ -1745,7 +1798,7 @@ class ReviewRegressionTest(FakeVBoxManageTest):
         dlg.exec.return_value = 1
         dlg.command = vboxfront.mediumio_cat_args('disk', source.uuid,
                                                 output=target.location)
-        with mock.patch.object(window_module, 'ContentsDialog', return_value=dlg), \
+        with mock.patch.object(media_edit_module, 'ContentsDialog', return_value=dlg), \
              mock.patch.object(QMessageBox, 'warning') as warning, \
              mock.patch.object(w.runner, 'run') as run:
             w.show_contents_selected()

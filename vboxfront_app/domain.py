@@ -1014,3 +1014,87 @@ def reclaim_line(name: str, before_mb: int | None, after_mb: int | None) -> str:
     if delta < 0:
         return f"[compact] {name}: grew by {format_mbytes(-delta)}"
     return f"[compact] {name}: nothing to reclaim ({format_mbytes(after_mb)} on disk)"
+
+
+def _history_tokens(command: str) -> list[str]:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    out = []
+    for token in tokens:
+        out.append(token)
+        # --output=/x.bin, --disk=<uuid>: the value is what names the medium.
+        if token.startswith("-") and "=" in token:
+            out.append(token.split("=", 1)[1])
+    return out
+
+
+def history_for(entries: list[dict], rec: MediumRecord,
+                extra_paths: list[str] = ()) -> list[dict]:
+    """The history entries that touched this medium, oldest first.
+
+    A command names a medium by UUID or by path, and the path may be spelled
+    differently from the listing's Location (relative, "..", a symlink), so
+    paths compare by `same_file`. `extra_paths` are earlier locations: a disk
+    that was moved was named by its old path before the move.
+    """
+    want_uuid = rec.uuid.strip("{}").lower()
+    paths = [p for p in (rec.location, *extra_paths) if p]
+    norm = {os.path.normpath(p) for p in paths}
+    picked = []
+    for entry in entries:
+        for token in _history_tokens(str(entry.get("command", ""))):
+            if token.strip("{}").lower() == want_uuid:
+                picked.append(entry)
+                break
+            if os.sep in token and (os.path.normpath(token) in norm
+                                    or any(same_file(token, p) for p in paths)):
+                picked.append(entry)
+                break
+    return picked
+
+
+#: VM states in which storageattach can change a disk's flags. A saved state
+#: holds the device configuration too, so it is as locked as a running VM.
+EDITABLE_VM_STATES = ("poweroff", "aborted")
+
+
+def discard_fix_plan(media: dict[str, list[MediumRecord]],
+                     infos: dict[str, dict[str, str]],
+                     nonrotational: bool = True) -> tuple[list[list[str]], list[str]]:
+    """storageattach commands that turn `--discard` on, and what was skipped.
+
+    Re-attaching the medium already in a slot edits its flags in place
+    (verified on 7.2.22: same medium, same UUID, `--hotpluggable` kept). Only
+    a powered-off VM can be changed; a running or saved one is reported with
+    its state instead. `nonrotational` also reports the disk as an SSD, which
+    is what makes Windows guests issue TRIM at all.
+    """
+    disks = {r.uuid: r for r in media.get("disk", [])}
+    commands: list[list[str]] = []
+    skipped: list[str] = []
+    for vm_uuid, info in infos.items():
+        vm = info.get("name", "") or vm_uuid
+        state = info.get("VMState", "poweroff")
+        for controller, ports in vm_storage_controllers(info):
+            devices = max_device_index(controller_types(info).get(controller, "")) + 1
+            for port in range(ports):
+                for device in range(devices):
+                    image = info.get(f"{controller}-ImageUUID-{port}-{device}", "")
+                    rec = disks.get(image)
+                    if rec is None:
+                        continue
+                    if info.get(f"{controller}-discard-{port}-{device}", "off") != "off":
+                        continue
+                    name = os.path.basename(rec.location) or rec.uuid
+                    if state not in EDITABLE_VM_STATES:
+                        skipped.append(f"{name} in {vm}: the VM is {state}; power it off first")
+                        continue
+                    args = ["storageattach", vm_uuid, "--storagectl", controller,
+                            "--port", str(port), "--device", str(device),
+                            "--type", "hdd", "--medium", rec.uuid, "--discard", "on"]
+                    if nonrotational:
+                        args += ["--nonrotational", "on"]
+                    commands.append(args)
+    return commands, skipped

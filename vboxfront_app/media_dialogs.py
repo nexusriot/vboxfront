@@ -49,6 +49,8 @@ from .domain import (
     same_file,
     state_word,
 )
+from .locate import missing_extents, read_image_identity
+from .locate_dialog import LocateMovedDialog
 from .models import MediumBackend, MediumRecord
 from .persistence import remember_folder, remembered_folder, trash_dir_for, trash_enabled
 from .theme import color_css, warning_color
@@ -290,11 +292,15 @@ class ResolveDialog(QDialog):
     with a dry run first, since a repair rewrites the image in place.
     """
 
-    def __init__(self, kind: str, medium: MediumRecord, parent=None):
+    def __init__(self, kind: str, medium: MediumRecord, parent=None,
+                 known: list[str] | None = None):
         super().__init__(parent)
         self.setWindowTitle("Resolve medium")
         self._kind = kind
         self._medium = medium
+        #: Every location the registry and library already use; the search
+        #: skips them, since none can be this medium's moved file.
+        self._known = list(known or [])
         self.command: list[str] | None = None
 
         # Ask the filesystem, not the record: VBoxSVC caches an open medium, so
@@ -334,8 +340,15 @@ class ResolveDialog(QDialog):
         self.path_edit = QLineEdit(medium.location)
         browse = QPushButton("Browse…")
         browse.clicked.connect(self._browse)
+        self.find_btn = QPushButton("Find by UUID…")
+        self.find_btn.setToolTip(
+            "Search folders for the file carrying this medium's UUID. "
+            "Reads image headers only; runs no command."
+        )
+        self.find_btn.clicked.connect(self._find)
         path_row.addWidget(self.path_edit, 1)
         path_row.addWidget(browse)
+        path_row.addWidget(self.find_btn)
         layout.addRow("New location:", path_row)
 
         layout.addRow(QLabel(
@@ -355,7 +368,47 @@ class ResolveDialog(QDialog):
         layout.addRow(buttons)
 
     def _sync_fields(self):
-        self.path_edit.setEnabled(self.relocate_radio.isChecked())
+        relocate = self.relocate_radio.isChecked()
+        self.path_edit.setEnabled(relocate)
+        self.find_btn.setEnabled(relocate)
+
+    def _find(self):
+        dlg = LocateMovedDialog(self._medium, self._known, self)
+        if dlg.exec() and dlg.chosen:
+            self.path_edit.setText(dlg.chosen)
+
+    def _relocation_blocker(self, path: str) -> tuple[str, bool]:
+        """Why `path` would not fix this medium: (message, refuse outright).
+
+        `modifymedium --setlocation` checks nothing: pointed at a different
+        image it exits 0, and the medium stays inaccessible with "UUID … does
+        not match the value stored in the media registry" (7.2.22). The UUID
+        inside the file settles it before anything runs. Formats that store
+        no UUID cannot be checked and pass.
+        """
+        identity = read_image_identity(path)
+        if identity is None:
+            return "", False
+        want = self._medium.uuid.strip().strip("{}").lower()
+        if identity.uuid != want:
+            return (
+                f"{os.path.basename(path)} is a different image: it carries "
+                f"UUID {identity.uuid}, and this medium is {want}. VirtualBox "
+                "would accept the new location and the medium would stay "
+                "inaccessible.\n\nUse Find by UUID… to search for the "
+                "right file.",
+                True,
+            )
+        lost = missing_extents(path, identity)
+        if lost:
+            return (
+                f"The descriptor names data files that are not beside it: "
+                f"{', '.join(lost)}. Move them next to {os.path.basename(path)} "
+                "first, or VirtualBox still cannot open the medium.\n\n"
+                "Re-point the registry anyway?",
+                False,
+            )
+        return "", False
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -385,6 +438,16 @@ class ResolveDialog(QDialog):
                     "That is the location already registered — pick the file's "
                     "new home, or repair the image instead.",
                 )
+                return
+            problem, refuse = self._relocation_blocker(path)
+            if problem and refuse:
+                QMessageBox.warning(self, "Different image", problem)
+                return
+            if problem and QMessageBox.warning(
+                self, "Incomplete image", problem,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
                 return
             self.command = setlocation_args(self._kind, self._medium.uuid, path)
         elif self.dryrun_radio.isChecked():

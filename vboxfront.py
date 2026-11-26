@@ -217,7 +217,8 @@ from vboxfront_app.app_dialogs import (
     OrphanScanDialog,
 )
 from vboxfront_app.attach_dialog import AttachDialog
-from vboxfront_app.window import MainWindow, ask_target_format_and_path
+from vboxfront_app.window import MainWindow
+from vboxfront_app.media_create import ask_target_format_and_path
 from vboxfront_app.app import main
 
 from PyQt6.QtCore import (

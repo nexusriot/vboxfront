@@ -24,6 +24,11 @@ __pycache__/
 *.vboxfront-backup-*
 *.vboxfront-partial-*
 
+# Backup bundles (a disk chain copied whole) and an interrupted one. They are
+# written wherever the user points them, often beside the images.
+*.vboxbundle/
+*.vboxbundle.partial/
+
 # Desktop metadata on the supported macOS/Windows development platforms.
 .DS_Store
 Thumbs.db

@@ -55,9 +55,10 @@ from .theme import color_css, error_color, muted_color, warning_color
 class CommandHistoryDialog(QDialog):
     """Every VBoxManage command this app has run, with its exit code."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, entries: list[dict] | None = None,
+                 title: str = ""):
         super().__init__(parent)
-        self.setWindowTitle("Command history")
+        self.setWindowTitle(title or "Command history")
         self.resize(760, 420)
         #: argv of a command the user asked to run again, minus the VBoxManage
         #: path; None unless Re-run was confirmed.
@@ -65,7 +66,10 @@ class CommandHistoryDialog(QDialog):
         layout = QVBoxLayout(self)
 
         self.list = QListWidget()
-        for entry in reversed(load_history()):
+        #: Showing one medium's history, so Clear (which empties the whole
+        #: history) is not offered.
+        self._filtered = entries is not None
+        for entry in reversed(load_history() if entries is None else entries):
             code = entry.get("exit")
             mark = "ok " if code == 0 else f"exit {code}"
             item = QListWidgetItem(
@@ -76,7 +80,8 @@ class CommandHistoryDialog(QDialog):
                 item.setForeground(error_color())
             self.list.addItem(item)
         if not self.list.count():
-            self.list.addItem("No commands recorded yet.")
+            self.list.addItem("No recorded command touched this medium."
+                              if self._filtered else "No commands recorded yet.")
         layout.addWidget(self.list)
 
         self.list.itemDoubleClicked.connect(lambda _item: self._rerun_selected())
@@ -103,7 +108,8 @@ class CommandHistoryDialog(QDialog):
         row.addWidget(copy_one)
         row.addWidget(copy_all)
         row.addWidget(as_script)
-        row.addWidget(clear)
+        if not self._filtered:
+            row.addWidget(clear)
         row.addStretch(1)
         row.addWidget(close)
         layout.addLayout(row)
@@ -396,7 +402,8 @@ class PlanDialog(QDialog):
     #: A third exec() result: run the batch after all.
     RUN = 2
 
-    def __init__(self, commands: list[list[str]], title: str = "", parent=None):
+    def __init__(self, commands: list[list[str]], title: str = "", parent=None,
+                 note: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Planned commands")
         self.resize(760, 380)
@@ -416,6 +423,10 @@ class PlanDialog(QDialog):
             "<i>Nothing has run. Copy takes the list as a shell script, with "
             "every argument quoted exactly as it would be passed.</i>"
         ))
+        if note:
+            extra = QLabel(note)
+            extra.setWordWrap(True)
+            layout.addWidget(extra)
 
         row = QHBoxLayout()
         copy = QPushButton("Copy as script")
@@ -469,6 +480,10 @@ class HealthDialog(QDialog):
         #: Set when the user asks for the attached-without---discard scan,
         #: which needs a showvminfo per VM and so is the caller's to run.
         self.want_discard_scan = False
+        #: Set by "Enable TRIM…": the caller re-reads the VMs and fixes them.
+        self.want_discard_fix = False
+        #: (kind, uuid) of a disk whose chain to repair, chosen from a finding.
+        self.repair_chain: tuple[str, str] | None = None
         self._media = media
         self._findings = health_findings(media)
 
@@ -501,6 +516,17 @@ class HealthDialog(QDialog):
             "is why compacting them reclaims nothing"
         )
         self.discard_btn.clicked.connect(self._start_discard_scan)
+        self.fix_trim_btn = QPushButton("Enable TRIM…")
+        self.fix_trim_btn.setToolTip(
+            "Re-attach the disks reported without --discard with it on "
+            "(powered-off VMs only)")
+        self.fix_trim_btn.clicked.connect(self._start_discard_fix)
+        self.chain_btn = QPushButton("Repair chain…")
+        self.chain_btn.setToolTip(
+            "Trace the selected disk's chain through its image files and "
+            "re-point or register what the registry lost")
+        self.chain_btn.clicked.connect(self._start_chain_repair)
+        self.fix_trim_btn.setEnabled(any(f.code == "no-discard" for f in self._findings))
         self.dry_run = QPushButton("Check VDI images (dry run)")
         self.dry_run.setToolTip(
             "internalcommands repairhd -dry-run on every accessible VDI: reads "
@@ -513,6 +539,8 @@ class HealthDialog(QDialog):
         row.addWidget(copy)
         row.addWidget(self.cleanup)
         row.addWidget(self.discard_btn)
+        row.addWidget(self.fix_trim_btn)
+        row.addWidget(self.chain_btn)
         row.addWidget(self.dry_run)
         row.addStretch(1)
         row.addWidget(close)
@@ -555,6 +583,9 @@ class HealthDialog(QDialog):
         if not self._findings:
             self.list.addItem("Nothing to report.")
         self.summary.setText(self._summary())
+        if hasattr(self, "fix_trim_btn"):
+            self.fix_trim_btn.setEnabled(
+                any(f.code == "no-discard" for f in self._findings))
 
     def _missing(self) -> list[HealthFinding]:
         """Findings for media whose backing file is gone.
@@ -604,6 +635,29 @@ class HealthDialog(QDialog):
 
     def _start_discard_scan(self):
         self.want_discard_scan = True
+        self.accept()
+
+    def _start_discard_fix(self):
+        self.want_discard_fix = True
+        self.accept()
+
+    def _chain_finding(self) -> HealthFinding | None:
+        item = self.list.currentItem()
+        finding = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if isinstance(finding, HealthFinding) and finding.kind == "disk" and finding.code in (
+                "orphan-child", "missing-file", "inaccessible"):
+            return finding
+        return None
+
+    def _start_chain_repair(self):
+        finding = self._chain_finding()
+        if finding is None:
+            QMessageBox.information(
+                self, "Repair chain",
+                "Select a disk finding (missing file, inaccessible, or parent not "
+                "registered) first.")
+            return
+        self.repair_chain = (finding.kind, finding.uuid)
         self.accept()
 
     def add_findings(self, extra: list[HealthFinding]):

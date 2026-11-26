@@ -32,8 +32,13 @@ The domain layer imports without Qt or a display.
 | `snapshots`, `library_views`, `batches` | Snapshot changes, saved filter/VM slot models, batch outcomes |
 | `theme`, `widgets`, `processes` | Palette helpers, media widgets, QProcess runners |
 | `disk_dialogs`, `media_dialogs`, `app_dialogs`, `attach_dialog` | Existing dialogs grouped by workflow |
+| `locate`, `locate_dialog` | UUIDs read from image headers; the moved-file search and its dialog; parent-first ordering |
+| `chains`, `bundles`, `settings_io` | Chain tracing/repair plans, backup bundles, settings export/import (no QtWidgets) |
+| `tools`, `tools_dialogs` | Window actions and dialogs for chains, bundles, TRIM, per-medium history and settings |
 | `feature_dialogs`, `features` | Recovery/trash/results/snapshot/VM dialogs and their action mixin |
-| `window`, `app` | Main window orchestration and application startup |
+| `window`, `app` | Main window layout, selection and UI state; application startup |
+| `refresh`, `command_queue` | The refresh chain; the command queue, plan checks and runner completion |
+| `media_create`, `media_edit`, `attach_actions`, `removal`, `health_actions` | Window actions by area, as mixins of `MainWindow` |
 
 The compatibility facade reexports existing names; new production code imports
 the owning module. Tests patch collaborators where they are used, rather than
@@ -152,6 +157,28 @@ whichever command happens to finish, and a batch remove would prune the wrong
 library entry. Each command now carries its own follow-up, and
 `_run_queue()` is the single entry point that starts one.
 
+**Single commands and plan mode.** A one-off action goes through
+`_run_single()`. In plan mode it shows the command in the same `PlanDialog`
+when `is_destructive_command()` says it changes data. That is the rule the
+history replay already uses, so "what plan mode stops" and "what a replay
+asks about" cannot drift apart. Declining clears `_followup`, which Move and
+Resolve set *before* launching. Otherwise a declined move would be applied
+by the next command that finishes. It also unlinks the encryption password
+files that `EncryptDialog.command_parts()` created for the command, because
+those normally go only when the command exits. Commands that write a new
+file, or replace one with a recoverable backup (import, export, clone), are
+not stopped. Neither are the re-run and recovery retry, which already make
+you type RUN.
+
+**Where the window code lives.** `MainWindow` keeps layout, selection, menus
+and UI state. Its actions are mixins by area (`refresh`, `command_queue`,
+`media_create`, `media_edit`, `attach_actions`, `removal`, `health_actions`).
+They are listed in the bases *before* the older `ToolsActionsMixin`,
+`WorkflowActionsMixin` and `FeatureActionsMixin`, so a method moved out of
+the class keeps precedence over a same-named one there, as it had before.
+Tests patch a collaborator in the module that now uses it
+(`media_edit.BatchConvertDialog`, `removal.RemoveDialog`, …).
+
 **Reading several VMs.** `_collect_vminfo()` walks a list of VM UUIDs one
 `showvminfo` at a time and hands over the lot. Sequential for the same reason
 the refresh chain is: there is one VBoxSVC, and a burst of clients against it
@@ -218,6 +245,36 @@ do about it. Two faults look identical there and need opposite fixes:
   dry run first because a real repair rewrites the image in place. Oracle
   ships `internalcommands` explicitly unsupported ("will change in
   incompatible ways without warning"), which the dialog says out loud.
+
+**Finding the moved file** (`locate.py`, `locate_dialog.py`). VirtualBox
+keeps a medium's UUID inside the image, so the new location can be identified
+for certain instead of guessed from a name. `read_image_identity()` reads
+it straight from the header, with no VBoxManage call and no VBoxSVC. The
+format is decided by content, not by extension. Layouts below were checked
+against images that VBoxManage 7.2.22 created:
+
+| Format | Where the UUID is | Byte order |
+|---|---|---|
+| VDI 1.x | signature `0xbeda107f` at 0x40, `uuidCreate` at 0x188, parent at 0x1a8 | little-endian GUID |
+| VHD | footer (last 512 bytes; dynamic images also at 0), `Unique Id` at 68; parent at 40 of the `cxsparse` header | **little-endian GUID**: VirtualBox copies the 16 bytes into an RTUUID unswapped, so it prints the reverse of the spec's order |
+| VMDK | `ddb.uuid.image` in the descriptor: a file of its own, or embedded in a `KDMV` sparse extent at the sector offset its header gives | text |
+
+RAW, ISO, QCOW, QED and Parallels store no UUID (VirtualBox makes one up on
+open). For those the search can only offer a file with the old name and a
+size within 1 MB of the listed capacity, and the results say it is the
+weaker match. A file storing a *different* UUID is never offered, whatever
+it is called. The walk follows the orphan scan's rules: registered and
+library paths, trash folders and symlinked directories are skipped. It runs
+on a `QThread`, because a home folder can take a while, and can be cancelled.
+
+**`--setlocation` checks nothing.** On 7.2.22, pointing a medium at a file
+with another UUID exits 0 and leaves it `inaccessible` with "UUID {…} of the
+medium … does not match the value {…} stored in the media registry". So
+Resolve reads the target's UUID first and refuses a mismatch. It also checks
+that a VMDK descriptor's extent files are beside it, because moving a
+monolithicFlat descriptor without its `-flat.vmdk` gives a medium VirtualBox
+still cannot open. That one asks rather than refuses. The e2e fake writes the
+same VDI header shape and models this `--setlocation` behaviour.
 
 **Trap:** the dialog decides which options apply by asking the *filesystem*,
 not by reading `rec.state`. VBoxSVC caches an open medium, so `State:` can
@@ -658,7 +715,7 @@ VBoxManage is replaced.
   collision message exists for. An earlier version guessed at that by
   comparing file contents, and declared two blank images of the same size
   copies of each other.
-- `e2e/test_e2e.py` drives 88 scenarios across create/remove (delete into the
+- `e2e/test_e2e.py` drives 107 scenarios across create/remove (delete into the
   trash, undo as a batch and newest-first, a DVD coming back to its own shelf,
   a failed unregister that must not move anything, and the real `--delete`
   once the trash is turned off through the Settings dialog itself),
@@ -668,7 +725,10 @@ VBoxManage is replaced.
   a simulated VBoxSVC restart, import RAW, health and resolve, `mediumio`
   extraction, properties, move, queue abort, history, and export. It also
   covers overwrite rollback, persistent undo/filters, guarded batch retry,
-  VM storage actions and snapshot comparisons.
+  VM storage actions and snapshot comparisons, and (1.12.0) finding moved
+  files by UUID, chain repair, backup and restore, the TRIM fix, per-medium
+  history, settings transfer, single-action plan mode and the new CLI
+  subcommands.
 - Container execution uses `--network none` and requires no VirtualBox or
   display. Fixtures isolate their files and settings in temporary locations;
   a locally supplied `XDG_CONFIG_HOME` is honored by the E2E package. The container runs both
@@ -732,6 +792,75 @@ cached only when the source stat signature is unchanged. The cache includes
 path, device/inode, length, nanosecond mtime and ctime and lasts for the session.
 The dialog refuses Import while a measurement is still active.
 
+## Chains, bundles and housekeeping
+
+All four build on the header reader in `locate.py`, so they read files and
+settings directly and keep `VBoxManage` for what changes the registry or a
+VM. Facts below were checked against VirtualBox 7.2.22.
+
+**Parent before child.** `showmediuminfo` on a differencing image whose
+parent is not open fails with "Parent medium with UUID {…} … is not found
+in the media registry". The library stores paths in the order they were
+added, so a child added before its parent failed on every refresh after
+VBoxSVC restarted. `parent_first()` reorders the disk library by the parent
+UUIDs in the headers before each refresh (and in the CLI's `load_media`).
+Chain repair and restore add their files in the same order.
+
+**Chain repair** (`chains.trace_chain`) follows the chain upward from a
+medium or a file. Each link is located by UUID: the registry's file if it is
+there and carries that UUID, otherwise a search of the given folders
+(`find_moved_image`, UUID matches only). The parent comes from the header,
+and from the registry only when the file is lost. The trace stops at a base,
+at a link that cannot be found, or at a loop. Repairs, in order of risk:
+`--setlocation` for registered members that moved, then library adds for
+unknown members, and, only on request, `sethdparentuuid` for an unregistered
+child whose parent is gone. `relink_blocker()` refuses that on a registered
+child, because the registry's own record of the chain would then disagree
+with the file. It also refuses a self-parent, and a parent that is already
+correct (where a re-point is enough). The registry is snapshotted before
+re-points run.
+
+**Bundles** (`bundles.py`) copy files instead of using `clonemedium`, because
+a clone gets a new UUID and a cloned child stops being a child. Each medium
+goes in its own `media/NN-uuid8/` folder so a VMDK descriptor's relative
+extent names stay valid. `copy_file` hashes every byte and seeks over
+all-zero 1 MiB blocks, so dynamic and flat images stay sparse. The digest is
+independent of holes. The bundle is built as `<name>.partial` and renamed
+only when complete. `read_manifest` refuses absolute paths and `..` in a
+manifest, so a crafted bundle cannot make a restore write outside its target
+folder. A restore verifies each file's digest as it copies. On any failure it
+removes only the files it created: copies open with `"x"`, so a file that
+appeared meanwhile is never deleted. The GUI also checks `list runningvms`
+before backing up, and the CLI refuses unless `--allow-running` is given.
+
+**TRIM fix.** `storageattach` with the medium already in the slot edits the
+attachment in place. On 7.2.22, `--discard on --nonrotational on` kept the
+UUID and `--hot-pluggable on`. `discard_fix_plan()` builds one command per
+slot whose `<ctl>-discard-<p>-<d>` is off, for VMs in `poweroff` or `aborted`
+state. A saved state includes the device configuration, so it is skipped like
+a running VM. The VMs are re-read when the fix is requested, not taken from
+the earlier scan.
+
+**Per-medium history** matches history entries by token, not substring. Each
+command is split with `shlex`, `--opt=value` values are split off, and a
+token matches the medium's UUID (case and braces ignored) or names the same
+file (`same_file`). The details pane reads the same JSON blob, so it still
+runs no command.
+
+**Settings export** includes what still means something on another machine.
+Window geometry and column state are per-screen binary blobs. The trash index
+names files on this machine's disks. History can name private paths, so it is
+opt-in. Import merges by default. It refuses a format version newer than its
+own. It does not import a VBoxManage path that is not executable here,
+because a wrong path makes every command fail to start.
+
+**E2E fake.** It now writes the parent UUID at VDI offset 0x1a8. Opening an
+unregistered file adopts the UUID and parent from its header, and it refuses
+a child whose parent is not registered, as VirtualBox does. `showvminfo`
+prints `VMState` and the per-slot `hot-pluggable`/`nonrotational`/`discard`
+flags. `storageattach` keeps unspecified flags when the same medium is
+re-attached, and refuses a running VM.
+
 ## Workflows built from existing commands
 
 Release 1.11.0 adds no new kind of VBoxManage call; each workflow strings
@@ -770,7 +899,7 @@ every action is a visible command.
 |---|---|
 | One visible operation at a time | CommandRunner and batches are serial; read-only CaptureRunner jobs may overlap them |
 | Changing an encryption password spills two secrets to disk | Two stdin secrets in one `encryptmedium` call do not work (the first read swallows the buffer), so the re-key writes two 0600 temp files and removes them when the command exits — including on the way out of the app |
-| Library entries are paths, not UUIDs | A moved-outside-the-app file shows as a `[library] could not open` note; prune in Settings |
+| Library entries are paths, not UUIDs | A moved-outside-the-app file shows as a `[library] could not open` note; prune in Settings. Find by UUID and Repair chain need a UUID, which only registered media have here |
 | `list -l` refresh cost | Three list calls plus new/changed library probes (and initial backend/system-property probes). Missing library entries invalidate their cache stamps and are reopened on the next refresh, so a transient missing row may require another refresh |
 | Create-time medium properties | `mediumproperty set` exits 0 and changes nothing for a property the backend only reads at creation (VDI's `AllocationBlockSize`); the dialog says so |
 | `repairhd -dry-run` sign-off | Prints "Corrupted VDI image repaired successfully" whatever it found, having written nothing; the verdict is the line above it |
@@ -785,4 +914,7 @@ every action is a visible command.
 | Undo last change is session-only | Move, re-point and Properties edits are undone by commands built from the listing before the change; after a restart the registry may have moved on, so nothing is persisted |
 | Compare contents reads everything | `mediumio cat` streams the whole guest-visible disk on both sides; a 100 GB disk is 200 GB read. Encrypted media are not offered |
 | Browse needs FUSE and a partition table | `vboximg-mount` ships with VirtualBox on Linux and macOS, not Windows, and is always read-only here. On 7.2 it refuses a blank disk ("Error parsing volumes on disk") and shows an unpartitioned filesystem only as `vhdd`. Its daemon holds the medium for a moment after unmount, so an immediate Remove can report it in use |
-| The end-to-end suite talks to a fake | Faithful to 7.2.12's output shapes, but it cannot notice VBoxManage changing them; the real-VirtualBox pass stays manual |
+| The end-to-end suite talks to a fake | Faithful to 7.2.12's output shapes (and the 7.2.22 behaviours noted above: header UUIDs, parent-first opens, in-place re-attach), but it cannot notice VBoxManage changing them; the real-VirtualBox pass stays manual |
+| UUID search covers VDI, VHD and VMDK | Formats that store no UUID (RAW, ISO, QCOW, QED, Parallels) can only be matched by name and size; VDI headers older than 1.x are not read |
+| Bundles copy files, not snapshots | A disk a running VM writes is copied inconsistently; the window warns and the CLI refuses without `--allow-running` |
+| A relink cannot be checked | `sethdparentuuid` onto a different parent is only right for an exact copy of the original parent; the app cannot verify that, so it is limited to unregistered children and asks first |

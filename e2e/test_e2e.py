@@ -44,6 +44,9 @@ from PyQt6.QtWidgets import (  # noqa: E402
 import vboxfront  # noqa: E402
 import vboxfront_app.media_dialogs as media_dialogs_module
 import vboxfront_app.feature_dialogs  # noqa: E402
+import vboxfront_app.disk_dialogs  # noqa: E402
+from vboxfront_app.locate_dialog import LocateMovedDialog  # noqa: E402
+from vboxfront_app.persistence import add_library_path  # noqa: E402
 import vboxfront_app.mounts  # noqa: E402
 import vboxfront_app.workflows  # noqa: E402
 from PyQt6.QtGui import QDesktopServices  # noqa: E402
@@ -1056,6 +1059,66 @@ class HealthAndResolveTest(E2ECase):
         self.assertEqual(self.read_state()["media"][0]["location"], moved)
         self.assertIn("elsewhere.vdi", self.rows())
 
+    def test_a_moved_file_is_found_by_its_uuid_and_re_pointed(self):
+        medium = self.seed_disk("roam.vdi")
+        decoy = self.seed_disk("decoy.vdi")
+        w = self.open_window()
+        # Renamed and buried two folders down, beside an unregistered copy of
+        # another disk that carries the old name: only the UUID can tell.
+        moved = os.path.join(self.images, "renamed", "deeper", "kept.vdi")
+        os.makedirs(os.path.dirname(moved))
+        os.replace(medium["location"], moved)
+        lookalike = os.path.join(self.images, "renamed", "roam.vdi")
+        shutil.copyfile(decoy["location"], lookalike)
+        self.select("roam.vdi")
+        searched = {}
+
+        def finder_exec(finder):
+            searched["folders"] = finder.folder_paths()
+            self.assertTrue(wait_until(lambda: not finder.searching()))
+            searched["found"] = [c.path for c in finder.candidates]
+            finder._use()
+            return QDialog.DialogCode.Accepted
+
+        def prepare(dlg):
+            with mock.patch.object(LocateMovedDialog, "exec", finder_exec):
+                dlg._find()
+            dlg._ok()
+
+        self.run_dialog(w.resolve_selected, prepare)
+        self.assertTrue(self.settled())
+
+        self.assertEqual(searched["folders"][0], self.images,
+                         "the search starts where the file used to be")
+        self.assertEqual(searched["found"], [moved])
+        self.assertEqual(self.read_state()["media"][0]["location"], moved)
+        self.assertEqual(self.rows()["kept.vdi"].text(COL_STATE), "created")
+        # It reads headers itself: no VBoxManage call opened the candidates.
+        self.assertFalse(any(lookalike in c for c in self.calls()))
+
+    def test_re_pointing_at_a_different_image_is_refused_before_running(self):
+        medium = self.seed_disk("lost.vdi")
+        other = self.seed_disk("other.vdi")
+        w = self.open_window()
+        os.remove(medium["location"])
+        impostor = os.path.join(self.dir, "lost.vdi")
+        shutil.copyfile(other["location"], impostor)
+        self.select("lost.vdi")
+        warned = []
+
+        def prepare(dlg):
+            dlg.path_edit.setText(impostor)
+            with mock.patch.object(QMessageBox, "warning",
+                                   side_effect=lambda *a: warned.append(a[2])):
+                dlg._ok()
+
+        self.run_dialog(w.resolve_selected, prepare)
+        self.assertTrue(self.settled())
+        self.assertTrue(warned and other["uuid"] in warned[0])
+        self.assertFalse(any("--setlocation" in c for c in self.calls()),
+                         "VirtualBox would have accepted it and stayed broken")
+        self.assertEqual(self.read_state()["media"][0]["location"], medium["location"])
+
     def test_a_dry_run_queues_one_read_only_check_per_vdi(self):
         self.seed_disk("check1.vdi")
         self.seed_disk("check2.vdi")
@@ -1966,6 +2029,89 @@ class PlanModeTest(E2ECase):
         self.assertEqual(len(self.calls()), before)
 
 
+class SinglePlanModeTest(E2ECase):
+    """Plan mode also stops single commands that change something."""
+
+    def tearDown(self):
+        vboxfront.set_plan_mode(False)
+        super().tearDown()
+
+    def plan(self, action, answer):
+        seen = {}
+
+        def plan_exec(dlg):
+            seen["script"] = vboxfront.plan_script(dlg._commands)
+            return answer
+
+        with mock.patch.object(vboxfront.PlanDialog, "exec", plan_exec):
+            action()
+            self.assertTrue(self.settled())
+        return seen.get("script", "")
+
+    def test_resize_is_shown_then_run_only_on_request(self):
+        medium = self.seed_disk("grow.vdi", capacity_mb=64)
+        w = self.open_window()
+        vboxfront.set_plan_mode(True)
+        self.select("grow.vdi")
+
+        def resize():
+            # The size the dialog returns is pinned by the patch below.
+            self.run_dialog(w.resize_selected, lambda dlg: None)
+
+        dialog_cls = vboxfront_app.disk_dialogs.ResizeDialog
+        with mock.patch.object(dialog_cls, "args",
+                               lambda self_, uuid: ["modifymedium", "disk", uuid,
+                                                    "--resize", "128"]):
+            script = self.plan(resize, 0)
+            self.assertIn("--resize 128", script)
+            self.assertEqual(self.read_state()["media"][0]["capacity_mb"], 64)
+            self.assertFalse(any("--resize" in c for c in self.calls()))
+            self.plan(resize, vboxfront.PlanDialog.RUN)
+        self.assertEqual(self.read_state()["media"][0]["capacity_mb"], 128)
+        self.assertEqual(medium["uuid"], self.read_state()["media"][0]["uuid"])
+
+    def test_a_declined_move_leaves_file_library_and_followup_alone(self):
+        medium = self.seed_disk("stay.vdi")
+        add_library_path("disk", medium["location"])
+        w = self.open_window()
+        vboxfront.set_plan_mode(True)
+        self.select("stay.vdi")
+        target = os.path.join(self.dir, "moved.vdi")
+        with mock.patch.object(QFileDialog, "getSaveFileName", return_value=(target, "")):
+            script = self.plan(w.move_selected, 0)
+        self.assertIn("--move", script)
+        self.assertTrue(os.path.exists(medium["location"]))
+        self.assertIsNone(w._followup)
+        # The next command that does run must not apply the declined move.
+        vboxfront.set_plan_mode(False)
+        w.show_info_selected()
+        self.assertTrue(self.settled())
+        self.assertIn(medium["location"], load_library("disk"))
+        self.assertNotIn(target, load_library("disk"))
+
+    def test_detach_waits_for_the_plan_and_info_does_not(self):
+        medium = self.seed_disk("held.vdi")
+        state = self.read_state()
+        state["vms"][0]["attachments"].append({"controller": "SATA", "port": 0, "device": 0,
+                                               "uuid": medium["uuid"],
+                                               "location": medium["location"]})
+        self.write_state(**state)
+        w = self.open_window()
+        vboxfront.set_plan_mode(True)
+        self.select("held.vdi")
+        with mock.patch.object(QMessageBox, "question", return_value=YES):
+            script = self.plan(w.detach_selected, 0)
+        self.assertIn("--medium none", script)
+        self.assertEqual(len(self.read_state()["vms"][0]["attachments"]), 1)
+        with mock.patch.object(QMessageBox, "question", return_value=YES):
+            self.plan(w.detach_selected, vboxfront.PlanDialog.RUN)
+        self.assertEqual(self.read_state()["vms"][0]["attachments"], [])
+        with mock.patch.object(vboxfront.PlanDialog, "exec") as plan:
+            w.show_info_selected()
+            self.assertTrue(self.settled())
+        plan.assert_not_called()
+
+
 class ReviewSafetyTest(E2ECase):
     def tearDown(self):
         vboxfront.set_plan_mode(False)
@@ -2160,6 +2306,328 @@ class ModularFeaturesTest(E2ECase):
         self.assertEqual(len(changes), 1)
         self.assertEqual(changes[0].change, 'moved')
         self.assertEqual(changes[0].uuid, medium['uuid'])
+
+
+class ToolsTest(E2ECase):
+    """Settings transfer, per-medium history, TRIM fix, chain repair, bundles."""
+
+    def attach(self, medium: dict, port: int = 0, vm: str = VM_UUID, **flags):
+        state = self.read_state()
+        target = next(v for v in state["vms"] if v["uuid"] == vm)
+        target["attachments"].append({"controller": "SATA", "port": port, "device": 0,
+                                      "uuid": medium["uuid"],
+                                      "location": medium["location"], **flags})
+        self.write_state(**state)
+
+    def seed_chain(self, base_name="base.vdi", kid_name="kid.vdi", register=True):
+        base = self.seed_disk(base_name)
+        kid = self.seed_disk(kid_name, parent=base["uuid"])
+        fake_vboxmanage.stamp_uuid(kid["location"], kid["uuid"], base["uuid"])
+        if not register:
+            state = self.read_state()
+            state["media"] = [m for m in state["media"]
+                              if m["uuid"] not in (base["uuid"], kid["uuid"])]
+            self.write_state(**state)
+        return base, kid
+
+    def slot(self, vm: str = VM_UUID, port: int = 0) -> dict:
+        target = next(v for v in self.read_state()["vms"] if v["uuid"] == vm)
+        return next(a for a in target["attachments"] if a["port"] == port)
+
+    def test_enable_trim_reattaches_in_place_and_skips_running_vms(self):
+        disk = self.seed_disk("slow.vdi")
+        other = self.seed_disk("busy.vdi")
+        self.attach(disk, hotpluggable="on")
+        state = self.read_state()
+        state["vms"].append(self.vm("beta", SECOND_VM_UUID))
+        state["running"] = [SECOND_VM_UUID]
+        self.write_state(**state)
+        self.attach(other, vm=SECOND_VM_UUID)
+        w = self.open_window()
+        seen = {}
+
+        def prepare(dlg):
+            seen["items"] = [dlg.list.item(i).text() for i in range(dlg.list.count())]
+
+        self.run_dialog(w.fix_discard_flags, prepare)
+        self.assertTrue(self.settled())
+        self.assertTrue(any("slow.vdi in alpha" in t for t in seen["items"]))
+        self.assertTrue(any("Skipped: busy.vdi in beta" in t for t in seen["items"]))
+        slot = self.slot()
+        self.assertEqual((slot["discard"], slot["nonrotational"], slot["hotpluggable"]),
+                         ("on", "on", "on"))
+        self.assertEqual(slot["uuid"], disk["uuid"], "the same medium stays attached")
+        self.assertNotIn("discard", self.slot(SECOND_VM_UUID))
+
+    def test_health_offers_enable_trim_after_the_scan(self):
+        disk = self.seed_disk("scan.vdi")
+        self.attach(disk)
+        w = self.open_window()
+        state = {}
+
+        def prepare(dlg):
+            state.setdefault("dialogs", []).append(type(dlg).__name__)
+            if type(dlg).__name__ == "HealthDialog":
+                if not dlg.fix_trim_btn.isEnabled():
+                    dlg._start_discard_scan()
+                else:
+                    dlg._start_discard_fix()
+
+        with mock.patch.object(QDialog, "exec", lambda dlg: (prepare(dlg), 1)[1]):
+            w.open_health()
+            self.assertTrue(self.settled())
+            self.assertTrue(wait_until(lambda: len(state.get("dialogs", [])) >= 3, 10))
+            self.assertTrue(self.settled())
+        self.assertEqual(state["dialogs"][:3],
+                         ["HealthDialog", "HealthDialog", "DiscardFixDialog"])
+        self.assertEqual(self.slot()["discard"], "on")
+
+    def test_chain_repair_repoints_a_moved_parent(self):
+        base, kid = self.seed_chain()
+        w = self.open_window()
+        moved = os.path.join(self.images, "archive", "base.vdi")
+        os.makedirs(os.path.dirname(moved))
+        os.replace(base["location"], moved)
+        self.select("kid.vdi")
+
+        def prepare(dlg):
+            self.assertTrue(wait_until(lambda: not dlg.busy()))
+            dlg._repair()
+
+        self.run_dialog(w.repair_chain_selected, prepare)
+        self.assertTrue(self.settled())
+        located = {m["uuid"]: m["location"] for m in self.read_state()["media"]}
+        self.assertEqual(located[base["uuid"]], moved)
+        self.assertEqual(located[kid["uuid"]], kid["location"])
+
+    def test_chain_repair_registers_an_unknown_chain_parent_first(self):
+        base, kid = self.seed_chain(register=False)
+        w = self.open_window()
+        self.assertNotIn("kid.vdi", self.rows())
+
+        def prepare(dlg):
+            self.assertTrue(wait_until(lambda: not dlg.busy()))
+            self.assertEqual([link.uuid for link in dlg.links], [base["uuid"], kid["uuid"]])
+            dlg._repair()
+
+        with mock.patch.object(QFileDialog, "getOpenFileName",
+                               return_value=(kid["location"], "")):
+            self.run_dialog(w.repair_chain_from_file, prepare)
+        self.assertTrue(self.settled())
+        self.assertEqual(load_library("disk"), [base["location"], kid["location"]])
+        media = {m["uuid"]: m for m in self.read_state()["media"]}
+        self.assertEqual(media[kid["uuid"]]["parent"], base["uuid"],
+                         "the registered child keeps the UUID and parent in its header")
+        self.assertIn("kid.vdi", self.rows())
+
+    def test_library_refresh_opens_a_parent_before_its_child(self):
+        base, kid = self.seed_chain(register=False)
+        save_library("disk", [kid["location"], base["location"]])
+        self.open_window()
+        self.assertIn("kid.vdi", self.rows())
+        self.assertIn("base.vdi", self.rows())
+        opens = [c for c in self.calls() if c.startswith("showmediuminfo")]
+        self.assertLess(opens.index(next(c for c in opens if "base.vdi" in c)),
+                        opens.index(next(c for c in opens if "kid.vdi" in c)))
+
+    def test_backup_then_restore_brings_back_the_same_chain(self):
+        base, kid = self.seed_chain()
+        with open(base["location"], "r+b") as handle:
+            handle.seek(4096)
+            handle.write(b"precious")
+        w = self.open_window()
+        self.select("kid.vdi")
+        out = os.path.join(self.dir, "backups")
+        os.makedirs(out)
+        made = {}
+
+        def backup(dlg):
+            dlg.dest.setText(out)
+            dlg.name.setText("kid-backup")
+            dlg._start()
+            self.assertTrue(wait_until(lambda: not dlg.busy(), 20))
+            made["path"] = dlg.bundle_path
+
+        self.run_dialog(w.backup_selected, backup)
+        self.assertTrue(self.settled())
+        self.assertTrue(made["path"].endswith("kid-backup.vboxbundle"))
+
+        # Disaster: both files and both registrations gone.
+        state = self.read_state()
+        state["media"] = []
+        self.write_state(**state)
+        os.remove(base["location"])
+        os.remove(kid["location"])
+        w.refresh_media()
+        self.assertTrue(self.settled())
+        self.assertEqual(self.rows(), {})
+
+        into = os.path.join(self.dir, "restored")
+
+        def restore(dlg):
+            dlg.into.setText(into)
+            dlg._start()
+            self.assertTrue(wait_until(lambda: not dlg.busy(), 20))
+
+        with mock.patch.object(QFileDialog, "getExistingDirectory",
+                               return_value=made["path"]):
+            self.run_dialog(w.restore_bundle, restore)
+        self.assertTrue(self.settled())
+        media = {m["uuid"]: m for m in self.read_state()["media"]}
+        self.assertEqual(media[base["uuid"]]["location"], os.path.join(into, "base.vdi"))
+        self.assertEqual(media[kid["uuid"]]["parent"], base["uuid"])
+        with open(os.path.join(into, "base.vdi"), "rb") as handle:
+            handle.seek(4096)
+            self.assertEqual(handle.read(8), b"precious")
+
+    def test_backup_warns_about_a_running_vm(self):
+        disk = self.seed_disk("live.vdi")
+        self.attach(disk)
+        state = self.read_state()
+        state["running"] = [VM_UUID]
+        self.write_state(**state)
+        w = self.open_window()
+        self.select("live.vdi")
+        seen = {}
+
+        def prepare(dlg):
+            seen["running"] = dlg._running
+
+        self.run_dialog(w.backup_selected, prepare, accept=False)
+        self.assertEqual(seen["running"], ["live.vdi (alpha)"])
+
+    def test_medium_history_shows_only_that_medium(self):
+        self.seed_disk("one.vdi")
+        self.seed_disk("two.vdi")
+        w = self.open_window()
+        self.select("one.vdi")
+        w.compact_selected()
+        self.assertTrue(self.settled())
+        self.select("two.vdi")
+        w.compact_selected()
+        self.assertTrue(self.settled())
+        self.select("one.vdi")
+        seen = {}
+
+        def prepare(dlg):
+            seen["lines"] = [dlg.list.item(i).text() for i in range(dlg.list.count())]
+
+        self.run_dialog(w.open_medium_history, prepare, accept=False)
+        one = self.rows()["one.vdi"].data(COL_NAME, Qt.ItemDataRole.UserRole)
+        self.assertEqual(len(seen["lines"]), 1)
+        self.assertIn(one, seen["lines"][0])
+        w.act_details.setChecked(True)
+        details = w.panes["disk"].details
+        labels = [details.topLevelItem(i).text(0) for i in range(details.topLevelItemCount())]
+        self.assertIn("History", labels)
+
+    def test_settings_export_and_import_through_the_window(self):
+        self.seed_disk("lib.vdi")
+        add_library_path("disk", os.path.join(self.images, "lib.vdi"))
+        w = self.open_window()
+        target = os.path.join(self.dir, "settings.json")
+        with mock.patch.object(QFileDialog, "getSaveFileName", return_value=(target, "")):
+            self.run_dialog(w.export_settings, lambda dlg: None)
+        with open(target, encoding="utf-8") as handle:
+            data = json.load(handle)
+        self.assertIn(os.path.join(self.images, "lib.vdi"), data["library"]["disk"])
+
+        save_library("disk", [])
+        with mock.patch.object(QFileDialog, "getOpenFileName", return_value=(target, "")), \
+                mock.patch.object(QMessageBox, "information"):
+            self.run_dialog(w.import_settings, lambda dlg: None)
+        self.assertTrue(self.settled())
+        self.assertEqual(load_library("disk"), [os.path.join(self.images, "lib.vdi")])
+
+
+class ToolsCliTest(E2ECase):
+    """The new headless subcommands against the fake."""
+
+    cli = CliTest.cli
+
+    def test_locate_and_health_fix_moved(self):
+        medium = self.seed_disk("gone.vdi")
+        moved = os.path.join(self.dir, "away", "renamed.vdi")
+        os.makedirs(os.path.dirname(moved))
+        os.replace(medium["location"], moved)
+        code, out = self.cli("locate", medium["uuid"], "--in", self.dir)
+        self.assertEqual((code, out.split("\t")[1].strip()), (0, moved))
+        code, out = self.cli("health", "--fix-moved", "--in", self.dir)
+        self.assertEqual(code, 0)
+        self.assertIn("--setlocation", out)
+        self.assertEqual(self.read_state()["media"][0]["location"], medium["location"],
+                         "a plan changes nothing")
+        code, _out = self.cli("health", "--fix-moved", "--in", self.dir, "--run")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["media"][0]["location"], moved)
+        self.assertEqual(self.cli("locate", "00000000-1111-2222-3333-444444444444",
+                                  "--in", self.dir)[0], 1)
+
+    def test_chain_fix_run(self):
+        base = self.seed_disk("cbase.vdi")
+        kid = self.seed_disk("ckid.vdi", parent=base["uuid"])
+        fake_vboxmanage.stamp_uuid(kid["location"], kid["uuid"], base["uuid"])
+        moved = os.path.join(self.dir, "elsewhere", "cbase.vdi")
+        os.makedirs(os.path.dirname(moved))
+        os.replace(base["location"], moved)
+        code, out = self.cli("chain", kid["uuid"], "--in", self.dir)
+        self.assertEqual(code, 0)
+        self.assertIn("re-point", out)
+        self.assertEqual(self.cli("chain", kid["uuid"], "--in", self.dir, "--fix",
+                                  "--run")[0], 0)
+        media = {m["uuid"]: m for m in self.read_state()["media"]}
+        self.assertEqual(media[base["uuid"]]["location"], moved)
+
+    def test_fix_discard_plans_then_runs(self):
+        disk = self.seed_disk("t.vdi")
+        state = self.read_state()
+        state["vms"][0]["attachments"].append({"controller": "SATA", "port": 1,
+                                               "device": 0, "uuid": disk["uuid"],
+                                               "location": disk["location"]})
+        self.write_state(**state)
+        code, out = self.cli("fix-discard")
+        self.assertIn("--discard on --nonrotational on", out)
+        self.assertNotIn("discard", self.read_state()["vms"][0]["attachments"][0])
+        self.assertEqual(self.cli("fix-discard", "--no-ssd", "--run")[0], 0)
+        slot = self.read_state()["vms"][0]["attachments"][0]
+        self.assertEqual(slot["discard"], "on")
+        self.assertNotIn("nonrotational", slot)
+
+    def test_backup_verify_restore(self):
+        disk = self.seed_disk("bk.vdi")
+        out_dir = os.path.join(self.dir, "bundles")
+        os.makedirs(out_dir)
+        code, out = self.cli("backup", disk["uuid"], "--to", out_dir, "--name", "bk")
+        self.assertEqual(code, 0, out)
+        bundle = out.strip()
+        self.assertEqual(self.cli("verify-bundle", bundle), (0, "intact\n"))
+        code, out = self.cli("restore", bundle, "--into", os.path.join(self.dir, "r"))
+        self.assertIn("skipped, already registered", out)
+        state = self.read_state()
+        state["media"] = []
+        self.write_state(**state)
+        os.remove(disk["location"])
+        code, out = self.cli("restore", bundle, "--into", os.path.join(self.dir, "r"))
+        self.assertEqual(code, 0, out)
+        restored = os.path.join(self.dir, "r", "bk.vdi")
+        self.assertIn(restored, load_library("disk"))
+        self.assertEqual(self.read_state()["media"][0]["uuid"], disk["uuid"])
+
+    def test_settings_and_history_round_trip(self):
+        target = os.path.join(self.dir, "s.json")
+        add_library_path("disk", "/somewhere/x.vdi")
+        self.assertEqual(self.cli("settings", "export", target)[0], 0)
+        save_library("disk", [])
+        code, out = self.cli("settings", "import", target, "--only", "library")
+        self.assertEqual(code, 0)
+        self.assertIn("Imported: library", out)
+        self.assertEqual(load_library("disk"), ["/somewhere/x.vdi"])
+        save_library("disk", [])
+        disk = self.seed_disk("h.vdi")
+        self.cli("compact-all", "--run")
+        code, out = self.cli("history", disk["uuid"])
+        self.assertEqual(code, 0)
+        self.assertIn("--compact", out)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 import sys
 import uuid as uuidlib
 
@@ -90,36 +91,78 @@ def file_mb(path: str) -> int:
     return (info.st_blocks * 512) // (1024 * 1024)
 
 
-#: Marks a UUID written into an image file. VirtualBox keeps a medium's UUID
-#: *inside* the image, which is the whole reason copying a .vdi produces two
-#: files it refuses to register together. Modelling that beats guessing from
-#: file contents, which called two blank images of the same size copies of
-#: each other.
-IMAGE_MAGIC = b"VBFAKE01"
+#: Where a UUID is written into an image file. VirtualBox keeps a medium's
+#: UUID *inside* the image, which is the whole reason copying a .vdi produces
+#: two files it refuses to register together. Modelling that beats guessing
+#: from file contents, which called two blank images of the same size copies
+#: of each other. The fake writes a real VDI 1.1 header shape (banner,
+#: signature at 0x40, version at 0x44, uuidCreate at 0x188, little-endian
+#: GUID order), so the app's header reader sees what it would on a real disk.
+VDI_BANNER = b"<<< Oracle VirtualBox Disk Image >>>\n"
+VDI_SIGNATURE = 0xBEDA107F
+VDI_UUID_OFFSET = 0x188
+VDI_PARENT_OFFSET = 0x1A8
+STAMP_LEN = VDI_PARENT_OFFSET + 16
 
 
-def stamp_uuid(path: str, uuid: str) -> None:
-    """Write a medium's UUID into its image file."""
-    if not uuid:
+def _raw(uuid: str) -> bytes:
+    try:
+        return uuidlib.UUID(uuid.strip("{}")).bytes_le if uuid else b""
+    except ValueError:
+        return b""
+
+
+def stamp_uuid(path: str, uuid: str, parent: str | None = None) -> None:
+    """Write a medium's UUID (and its parent's) into its image file.
+
+    `parent=None` keeps whatever parent the file already records, as
+    `sethduuid` does.
+    """
+    raw = _raw(uuid)
+    if not raw:
         return
+    if parent is None:
+        parent = read_parent(path)
+    header = bytearray(STAMP_LEN)
+    header[:len(VDI_BANNER)] = VDI_BANNER
+    struct.pack_into("<II", header, 0x40, VDI_SIGNATURE, 0x00010001)
+    header[VDI_UUID_OFFSET:VDI_UUID_OFFSET + 16] = raw
+    header[VDI_PARENT_OFFSET:STAMP_LEN] = _raw(parent) or bytes(16)
     try:
         with open(path, "r+b") as handle:
             handle.seek(0)
-            handle.write(IMAGE_MAGIC + uuid.encode())
+            handle.write(bytes(header))
     except OSError:
         pass
+
+
+def is_stamped(head: bytes) -> bool:
+    return (len(head) >= STAMP_LEN
+            and struct.unpack_from("<I", head, 0x40)[0] == VDI_SIGNATURE)
 
 
 def read_uuid(path: str) -> str:
     """The UUID stamped into an image file, or "" when there is none."""
     try:
         with open(path, "rb") as handle:
-            head = handle.read(len(IMAGE_MAGIC) + 36)
+            head = handle.read(STAMP_LEN)
     except OSError:
         return ""
-    if not head.startswith(IMAGE_MAGIC):
+    if not is_stamped(head):
         return ""
-    return head[len(IMAGE_MAGIC):].decode("ascii", "replace")
+    return str(uuidlib.UUID(bytes_le=head[VDI_UUID_OFFSET:VDI_UUID_OFFSET + 16]))
+
+
+def read_parent(path: str) -> str:
+    """The parent UUID stamped into an image file, or ""."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(STAMP_LEN)
+    except OSError:
+        return ""
+    if not is_stamped(head) or head[VDI_PARENT_OFFSET:STAMP_LEN] == bytes(16):
+        return ""
+    return str(uuidlib.UUID(bytes_le=head[VDI_PARENT_OFFSET:STAMP_LEN]))
 
 
 def write_image(path: str, size_mb: int, fixed: bool = False,
@@ -135,8 +178,6 @@ def write_image(path: str, size_mb: int, fixed: bool = False,
     stamp_uuid(path, uuid)
 
 
-STAMP_LEN = len(IMAGE_MAGIC) + 36
-
 
 def file_chunks(path: str, capacity: int, chunk: int):
     """An image file's data region, the stamp masked, padded to capacity.
@@ -150,7 +191,7 @@ def file_chunks(path: str, capacity: int, chunk: int):
         while pos < capacity:
             want = min(chunk, capacity - pos)
             data = handle.read(want).ljust(want, b"\0")
-            if pos == 0 and data.startswith(IMAGE_MAGIC):
+            if pos == 0 and is_stamped(data):
                 data = b"\0" * STAMP_LEN + data[STAMP_LEN:]
             pos += len(data)
             yield data
@@ -305,7 +346,15 @@ def cmd_showmediuminfo(state: dict, args: list[str]) -> int:
                     "already exists"
                 )
             kind = EXT_KIND.get(os.path.splitext(path)[1].lower(), args[0])
-            medium = register(state, path, kind=kind)
+            # Like VirtualBox: the image keeps the identity in its header, and
+            # a differencing image cannot be opened before its parent.
+            parent = read_parent(path)
+            if parent and find(state, parent) is None:
+                return fail(
+                    f"Parent medium with UUID {{{parent}}} of the medium '{path}' "
+                    "is not found in the media registry")
+            medium = register(state, path, kind=kind, uuid=read_uuid(path),
+                              parent=parent)
             save(state)
         else:
             return fail(f"Could not find file for the medium '{args[1]}'")
@@ -315,7 +364,7 @@ def cmd_showmediuminfo(state: dict, args: list[str]) -> int:
 
 def register(state: dict, path: str, kind: str = "disk", fmt: str = "",
              capacity_mb: int | None = None, variant: str = "dynamic default",
-             parent: str = "") -> dict:
+             parent: str = "", uuid: str = "") -> dict:
     fmt = fmt or os.path.splitext(path)[1].lstrip(".").upper() or "VDI"
     if capacity_mb is None:
         try:
@@ -323,14 +372,14 @@ def register(state: dict, path: str, kind: str = "disk", fmt: str = "",
         except OSError:
             capacity_mb = 1
     medium = {
-        "uuid": str(uuidlib.uuid4()), "location": os.path.abspath(path),
+        "uuid": uuid or str(uuidlib.uuid4()), "location": os.path.abspath(path),
         "kind": kind, "format": fmt, "capacity_mb": capacity_mb,
         "variant": variant, "type": "normal", "state": "created",
         "parent": parent, "encryption": "disabled", "properties": {},
     }
     if fmt.upper() == "VDI":
         medium["properties"]["AllocationBlockSize"] = "1048576"
-    stamp_uuid(medium["location"], medium["uuid"])
+    stamp_uuid(medium["location"], medium["uuid"], parent)
     state["media"].append(medium)
     return medium
 
@@ -466,8 +515,18 @@ def cmd_modifymedium(state: dict, args: list[str]) -> int:
     relocate = opt(rest, "--setlocation")
     if relocate:
         medium["location"] = os.path.abspath(relocate)
-        medium["state"] = "created"
-        medium.pop("access_error", None)
+        # Like 7.2.22: the new location is accepted whatever it holds, and a
+        # file carrying another UUID leaves the medium inaccessible.
+        stamped = read_uuid(relocate)
+        if stamped and stamped != medium["uuid"]:
+            medium["state"] = "inaccessible"
+            medium["access_error"] = (
+                f"UUID {{{stamped}}} of the medium '{medium['location']}' does "
+                f"not match the value {{{medium['uuid']}}} stored in the media "
+                "registry")
+        else:
+            medium["state"] = "created"
+            medium.pop("access_error", None)
     save(state)
     return 0
 
@@ -593,7 +652,15 @@ def cmd_storageattach(state: dict, args: list[str]) -> int:
         return fail("storageattach: --storagectl, --port and --device are required")
     if not any(c["name"] == controller for c in vm["controllers"]):
         return fail(f"Could not find a controller named '{controller}'")
+    if vm["uuid"] in state.get("running", []):
+        # Changing a running VM's storage needs a hot-pluggable slot and a
+        # session; the fake models the common answer.
+        return fail(f"The machine '{vm['name']}' is already locked for a session "
+                    "(or being unlocked) (VBOX_E_INVALID_OBJECT_STATE)")
     slot = {"controller": controller, "port": int(port), "device": int(device)}
+    previous = next((a for a in vm.get("attachments", [])
+                     if (a["controller"], a["port"], a["device"])
+                     == (slot["controller"], slot["port"], slot["device"])), None)
     vm["attachments"] = [
         a for a in vm.get("attachments", [])
         if (a["controller"], a["port"], a["device"])
@@ -611,6 +678,16 @@ def cmd_storageattach(state: dict, args: list[str]) -> int:
                               capacity_mb=medium["capacity_mb"], parent=medium["uuid"])
         slot["uuid"] = medium["uuid"] if medium else ""
         slot["location"] = medium["location"] if medium else token
+        # Re-attaching the medium already in the slot edits its flags in
+        # place, keeping the ones not given (7.2.22 kept --hotpluggable).
+        if previous and previous.get("uuid") and previous.get("uuid") == slot["uuid"]:
+            for flag in ("discard", "nonrotational", "hotpluggable"):
+                if flag in previous:
+                    slot[flag] = previous[flag]
+        for flag in ("discard", "nonrotational", "hotpluggable"):
+            value = opt(args, "--" + flag)
+            if value is not None:
+                slot[flag] = value
         vm["attachments"].append(slot)
     save(state)
     return 0
@@ -625,6 +702,8 @@ def cmd_showvminfo(state: dict, args: list[str]) -> int:
         return fail(f"Could not find a registered machine named '{args[0]}'")
     print(f'name="{vm["name"]}"')
     print(f'UUID="{vm["uuid"]}"')
+    running = vm["uuid"] in state.get("running", [])
+    print(f'VMState="{"running" if running else "poweroff"}"')
     for i, ctl in enumerate(vm["controllers"]):
         print(f'storagecontrollername{i}="{ctl["name"]}"')
         print(f'storagecontrollertype{i}="{ctl.get("type", "IntelAhci")}"')
@@ -647,6 +726,12 @@ def cmd_showvminfo(state: dict, args: list[str]) -> int:
                 if att.get("uuid"):
                     print(f'"{ctl["name"]}-ImageUUID-{port}-{device}"'
                           f'="{att["uuid"]}"')
+                    print(f'"{ctl["name"]}-hot-pluggable-{port}-{device}"'
+                          f'="{att.get("hotpluggable", "off")}"')
+                    print(f'"{ctl["name"]}-nonrotational-{port}-{device}"'
+                          f'="{att.get("nonrotational", "off")}"')
+                    print(f'"{ctl["name"]}-discard-{port}-{device}"'
+                          f'="{att.get("discard", "off")}"')
     return 0
 
 
@@ -798,6 +883,8 @@ def cmd_internalcommands(state: dict, args: list[str]) -> int:
         if sub == "sethduuid":
             # Rewriting the identity inside the file is the whole job.
             stamp_uuid(path, given)
+        else:
+            stamp_uuid(path, read_uuid(path) or str(uuidlib.uuid4()), given)
         medium = find(state, path)
         if medium is not None:
             # Stamping a registered image desynchronises it, exactly as the

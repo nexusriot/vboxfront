@@ -20,6 +20,7 @@ from .constants import COLUMNS, COL_CAPACITY, COL_LOCATION, COL_NAME, COL_SIZE
 from .domain import (
     encryption_word,
     format_mbytes,
+    history_for,
     is_inaccessible,
     medium_details,
     medium_type_word,
@@ -34,6 +35,7 @@ from .domain import (
     totals_line,
 )
 from .models import MediumRecord
+from .persistence import load_history
 from .theme import color_css, error_color, muted_color
 
 
@@ -239,6 +241,20 @@ class MediaPane(QWidget):
             item.setToolTip(1, value)
             if label in ("Access error",):
                 item.setForeground(1, error_color())
+            self.details.addTopLevelItem(item)
+        # The history is a small JSON blob already on this machine, so the
+        # pane still runs no command for it.
+        touched = history_for(load_history(), rec)
+        if touched:
+            last = touched[-1]
+            mark = "ok" if last.get("exit") == 0 else f"exit {last.get('exit')}"
+            item = QTreeWidgetItem([
+                "History",
+                f"{len(touched)} command(s); last {last.get('when', '')} [{mark}] "
+                f"{last.get('command', '')}",
+            ])
+            item.setToolTip(1, "\n".join(
+                f"{e.get('when', '')}  {e.get('command', '')}" for e in touched[-10:]))
             self.details.addTopLevelItem(item)
         self.details.resizeColumnToContents(0)
 

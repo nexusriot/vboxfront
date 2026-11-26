@@ -1,3 +1,34 @@
+vboxfront (1.12.0) unstable; urgency=medium
+
+  * Find a moved image by the UUID stored in its VDI, VHD or VMDK header
+    (Resolve → Find by UUID…). Resolve refuses to re-point a medium at a
+    file carrying another UUID, which VirtualBox accepts and leaves broken.
+  * Backup bundles: a medium and its whole chain copied byte for byte with a
+    SHA-256 manifest, VMDK extents included and zero runs kept sparse.
+    Verify and restore; restore checks every checksum before registering
+    the chain parent first with its original UUIDs.
+  * Repair chain: trace a differencing chain through its image headers,
+    re-point moved members, register unknown ones parent first, and relink
+    an unregistered child after confirmation (sethdparentuuid).
+  * Open library images parent first on refresh, so a child added before
+    its parent no longer fails after VBoxSVC restarts.
+  * Enable TRIM: re-attach disks in powered-off VMs with --discard on (and
+    optionally --nonrotational on), in place, from Media health or the menu.
+  * Per-medium command history, in a dialog and in the details pane.
+  * Export and import settings (preferences, library, saved filters,
+    folders, optional history) as JSON, merging or replacing.
+  * Plan mode also shows single actions that change data (resize, move,
+    resolve, attach, detach, encryption, FAT format, UUID stamping, relink)
+    before running them; declining removes any password file made for them.
+  * CLI: locate, chain, history, fix-discard, backup, restore, verify-bundle,
+    settings, and health --fix-moved.
+  * Split the main window into area mixins (refresh, command queue, create,
+    edit, attach, removal, health); no behaviour change.
+  * The end-to-end fake records parent UUIDs in its image headers, VM state
+    and per-slot attach flags, as VirtualBox 7.2.22 does.
+
+ -- Vlad Ananyev <vlananyev@gmail.com>  Fri, 27 Nov 2026 00:00:00 +0300
+
 vboxfront (1.11.0) unstable; urgency=medium
 
   * Compare two images' guest-visible contents via `mediumio cat` hashes;
